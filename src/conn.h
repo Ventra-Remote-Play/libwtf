@@ -8,10 +8,12 @@ extern "C" {
 QUIC_CONNECTION_CALLBACK wtf_connection_callback;
 
 wtf_connection* wtf_connection_create(wtf_server* server, HQUIC quic_connection);
+wtf_connection* wtf_connection_create_client(wtf_client* client, HQUIC quic_connection);
 void wtf_connection_destroy(wtf_connection* conn);
+void wtf_connection_add_ref(wtf_connection* conn);
+void wtf_connection_release(wtf_connection* conn);
 wtf_session* wtf_connection_find_session(wtf_connection* conn, uint64_t session_id);
-
-void wtf_connection_process_buffered_data(wtf_connection* conn, wtf_session* session);
+bool wtf_connection_uses_webtransport_flow_control(const wtf_connection* conn);
 
 bool wtf_connection_associate_stream_with_session(wtf_connection* conn, wtf_http3_stream* h3_stream,
                                                   wtf_session* session);

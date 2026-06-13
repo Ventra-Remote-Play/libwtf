@@ -38,7 +38,7 @@ uint8_t* wtf_varint_encode_2bytes(wtf_varint_t value, uint8_t* buffer);
 //! @param offset Pointer to current offset in buffer (updated on success)
 //! @param value Pointer to store decoded value
 //! @return true on success, false on failure (insufficient data)
-bool wtf_varint_decode(uint16_t buffer_length, const uint8_t* buffer, uint16_t* offset,
+bool wtf_varint_decode(size_t buffer_length, const uint8_t* buffer, size_t* offset,
                        wtf_varint_t* value);
 
 #ifdef __cplusplus

@@ -1,0 +1,28 @@
+diff --git a/src/core/crypto_tls.c b/src/core/crypto_tls.c
+index 4fa6b8cc7..e339f910e 100644
+--- a/src/core/crypto_tls.c
++++ b/src/core/crypto_tls.c
+@@ -66,7 +66,7 @@ typedef enum eSniNameType {
+ #define QUIC_TP_ID_MIN_ACK_DELAY                            0xFF04DE1BULL   // varint
+ #define QUIC_TP_ID_CIBIR_ENCODING                           0x1000          // {varint, varint}
+ #define QUIC_TP_ID_GREASE_QUIC_BIT                          0x2AB2          // N/A
+-#define QUIC_TP_ID_RELIABLE_RESET_ENABLED                   0x17f7586d2cb570   // varint
++#define QUIC_TP_ID_RELIABLE_RESET_ENABLED                   0x17f7586d2cb571   // varint
+ #define QUIC_TP_ID_ENABLE_TIMESTAMP                         0x7158          // varint
+ 
+ BOOLEAN
+diff --git a/src/core/frame.h b/src/core/frame.h
+index 35b94bd81..11f64ed23 100644
+--- a/src/core/frame.h
++++ b/src/core/frame.h
+@@ -150,8 +150,8 @@ typedef enum QUIC_FRAME_TYPE {
+     QUIC_FRAME_CONNECTION_CLOSE_1   = 0x1dULL,
+     QUIC_FRAME_HANDSHAKE_DONE       = 0x1eULL,
+     /* 0x1f to 0x20 are unused currently */
+-    QUIC_FRAME_RELIABLE_RESET_STREAM = 0x21ULL, // intentionally ignore type 0x20 of QUIC_RESET_STREAM cause it's likely to be removed from RFC.
+-    /* 0x22 to 0x2f are unused currently */
++    QUIC_FRAME_RELIABLE_RESET_STREAM = 0x24ULL,
++    /* 0x21 to 0x23 and 0x25 to 0x2f are unused currently */
+     QUIC_FRAME_DATAGRAM             = 0x30ULL, // to 0x31
+     QUIC_FRAME_DATAGRAM_1           = 0x31ULL,
+     /* 0x32 to 0xad are unused currently */

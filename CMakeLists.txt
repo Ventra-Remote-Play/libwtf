@@ -52,6 +52,21 @@ option(WTF_BUILD_TESTS "Build tests" OFF)
 option(WTF_BUILD_SAMPLES "Build sample applications" OFF)
 option(WTF_ENABLE_LOGGING "Enable logging support" ON)
 option(WTF_USE_EXTERNAL_MSQUIC "Use an external msquic installation" OFF)
+option(WTF_APPLY_BUNDLED_MSQUIC_PATCHES "Apply libwtf patches to the bundled msquic submodule" ON)
+option(WTF_ENABLE_COVERAGE "Build tests with coverage instrumentation" OFF)
+option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+
+if(WTF_ENABLE_COVERAGE)
+    if(NOT WTF_BUILD_TESTS)
+        message(FATAL_ERROR "WTF_ENABLE_COVERAGE requires WTF_BUILD_TESTS=ON")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        set(WTF_COVERAGE_COMPILE_OPTIONS --coverage -O0 -g)
+        set(WTF_COVERAGE_LINK_OPTIONS --coverage)
+    else()
+        message(FATAL_ERROR "WTF_ENABLE_COVERAGE currently supports GCC/Clang builds")
+    endif()
+endif()
 
 set(WTF_VERSION ${GIT_VERSION})
 configure_file(
@@ -150,9 +165,9 @@ else()
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
     
     if(WIN32)
-        set(QUIC_TLS "schannel" CACHE STRING "Use Schannel on Windows")
+        set(QUIC_TLS_LIB "schannel" CACHE STRING "Use Schannel on Windows")
     else()
-        set(QUIC_TLS "openssl3" CACHE STRING "Use OpenSSL on non-Windows")
+        set(QUIC_TLS_LIB "openssl" CACHE STRING "Use OpenSSL on non-Windows")
     endif()
     
     set(QUIC_BUILD_SHARED ON CACHE BOOL "Builds MsQuic as a dynamic library")
@@ -176,6 +191,55 @@ else()
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         add_compile_options(-Wno-invalid-unevaluated-string)
+    endif()
+
+    if(WTF_APPLY_BUNDLED_MSQUIC_PATCHES)
+        find_package(Git QUIET)
+        if(NOT Git_FOUND)
+            message(FATAL_ERROR "Git is required to apply bundled MsQuic patches")
+        endif()
+
+        set(WTF_BUNDLED_MSQUIC_PATCHES
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/msquic/reliable-reset-draft07.patch
+        )
+
+        foreach(WTF_BUNDLED_MSQUIC_PATCH IN LISTS WTF_BUNDLED_MSQUIC_PATCHES)
+            execute_process(
+                COMMAND ${GIT_EXECUTABLE} apply --check ${WTF_BUNDLED_MSQUIC_PATCH}
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/msquic
+                RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY
+                OUTPUT_QUIET
+                ERROR_QUIET
+            )
+
+            if(WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY EQUAL 0)
+                execute_process(
+                    COMMAND ${GIT_EXECUTABLE} apply ${WTF_BUNDLED_MSQUIC_PATCH}
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/msquic
+                    RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_RESULT
+                )
+                if(NOT WTF_BUNDLED_MSQUIC_PATCH_RESULT EQUAL 0)
+                    message(FATAL_ERROR "Failed to apply bundled MsQuic patch: ${WTF_BUNDLED_MSQUIC_PATCH}")
+                endif()
+                message(STATUS "Applied bundled MsQuic patch: ${WTF_BUNDLED_MSQUIC_PATCH}")
+            else()
+                execute_process(
+                    COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${WTF_BUNDLED_MSQUIC_PATCH}
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/msquic
+                    RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_ALREADY_APPLIED
+                    OUTPUT_QUIET
+                    ERROR_QUIET
+                )
+                if(WTF_BUNDLED_MSQUIC_PATCH_ALREADY_APPLIED EQUAL 0)
+                    message(STATUS "Bundled MsQuic patch already applied: ${WTF_BUNDLED_MSQUIC_PATCH}")
+                else()
+                    message(FATAL_ERROR
+                        "Bundled MsQuic patch no longer applies cleanly: "
+                        "${WTF_BUNDLED_MSQUIC_PATCH}. Update or remove the patch."
+                    )
+                endif()
+            endif()
+        endforeach()
     endif()
     
     add_subdirectory(msquic)
@@ -204,22 +268,22 @@ else()
 endif()
 
 if(WIN32)
-    set(PLATFORM_LIBS ws2_32 iphlpapi bcrypt)
+    set(PLATFORM_LIBS ws2_32 iphlpapi bcrypt crypt32)
     set(PLATFORM_LIBS ${PLATFORM_LIBS} $<$<CONFIG:Debug>:dbghelp>)
 else()
     find_package(Threads REQUIRED)
+    if(NOT APPLE)
+        find_package(OpenSSL REQUIRED)
+    endif()
     set(PLATFORM_LIBS Threads::Threads)
     if(NOT APPLE)
-        list(APPEND PLATFORM_LIBS rt m)
+        list(APPEND PLATFORM_LIBS rt m OpenSSL::Crypto)
     else()
-        list(APPEND PLATFORM_LIBS "-framework Security")
+        list(APPEND PLATFORM_LIBS "-framework Security" "-framework CoreFoundation")
     endif()
 
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         set(PLATFORM_LIBS ${PLATFORM_LIBS} $<$<CONFIG:Debug>:dl>)
-    endif()
-    if(APPLE)
-        set(PLATFORM_LIBS ${PLATFORM_LIBS} $<$<CONFIG:Debug>:-framework\ CoreFoundation>)
     endif()
 endif()
 
@@ -251,8 +315,11 @@ set(WTF_SOURCES
     src/stream.c
     src/session.c   
     src/settings.c
+    src/draft.c
+    src/cert.c
     src/conn.c
     src/http3.c
+    src/client.c
     src/server.c
     src/context.c
     ${WTF_EXPORT_SOURCES}
@@ -262,7 +329,7 @@ set(WTF_PUBLIC_HEADERS
     include/wtf.h
 )
 
-add_library(wtf SHARED ${WTF_SOURCES})
+add_library(wtf ${WTF_SOURCES})
 
 set_target_properties(wtf PROPERTIES
     VERSION ${PROJECT_VERSION}
@@ -303,6 +370,11 @@ target_link_libraries(wtf
         ${PLATFORM_LIBS}
 )
 
+if(WTF_ENABLE_COVERAGE)
+    target_compile_options(wtf PRIVATE ${WTF_COVERAGE_COMPILE_OPTIONS})
+    target_link_options(wtf PRIVATE ${WTF_COVERAGE_LINK_OPTIONS})
+endif()
+
 if(WTF_ENABLE_LOGGING)
     target_compile_definitions(wtf PRIVATE WTF_ENABLE_LOGGING=1)
 endif()
@@ -319,18 +391,20 @@ if(NOT WIN32)
     )
 endif()
 
-if(WIN32)
-    set_target_properties(wtf PROPERTIES
-        LINK_FLAGS "/DEF:${CMAKE_CURRENT_BINARY_DIR}/wtf.def"
-    )
-elseif(APPLE)
-    set_target_properties(wtf PROPERTIES
-        LINK_FLAGS "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/cmake/export/darwin/exports.txt -Wl,-dead_strip -Wl,-x"
-    )
-elseif(UNIX)
-    set_target_properties(wtf PROPERTIES
-        LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/export/linux/exports.txt -Wl,--gc-sections -Wl,--strip-all"
-    )
+if(BUILD_SHARED_LIBS)
+    if(WIN32)
+        set_target_properties(wtf PROPERTIES
+            LINK_FLAGS "/DEF:${CMAKE_CURRENT_BINARY_DIR}/wtf.def"
+        )
+    elseif(APPLE)
+        set_target_properties(wtf PROPERTIES
+            LINK_FLAGS "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/cmake/export/darwin/exports.txt -Wl,-dead_strip -Wl,-x"
+        )
+    elseif(UNIX)
+        set_target_properties(wtf PROPERTIES
+            LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/export/linux/exports.txt -Wl,--gc-sections -Wl,--strip-all"
+        )
+    endif()
 endif()
 
 add_library(WebTransport::wtf ALIAS wtf)

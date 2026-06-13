@@ -1,16 +1,45 @@
-#include "server.h"
+#include "types.h"
+
+#ifdef _WIN32
+    #include <winsock2.h>
+#else
+    #include <arpa/inet.h>
+#endif
 
 #include "conn.h"
 #include "log.h"
 #include "utils.h"
 
-extern void QuicAddrSetPort(_In_ QUIC_ADDR* Addr, _In_ uint16_t Port);
-extern void QuicAddrSetFamily(_In_ QUIC_ADDR* Addr, _In_ QUIC_ADDRESS_FAMILY Family);
+static void wtf_quic_addr_set_family(QUIC_ADDR* address, QUIC_ADDRESS_FAMILY family)
+{
+#ifdef _WIN32
+    address->si_family = family;
+#else
+    address->Ip.sa_family = family;
+#endif
+}
 
-static QUIC_STATUS QUIC_API wtf_listener_callback(HQUIC Listener, void* Context,
+static void wtf_quic_addr_set_port(QUIC_ADDR* address, uint16_t port)
+{
+    uint16_t network_port = htons(port);
+#ifdef _WIN32
+    if (address->si_family == QUIC_ADDRESS_FAMILY_INET) {
+        address->Ipv4.sin_port = network_port;
+    } else {
+        address->Ipv6.sin6_port = network_port;
+    }
+#else
+    if (address->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET) {
+        address->Ipv4.sin_port = network_port;
+    } else {
+        address->Ipv6.sin6_port = network_port;
+    }
+#endif
+}
+
+static QUIC_STATUS QUIC_API wtf_listener_callback(HQUIC Listener WTF_MAYBE_UNUSED, void* Context,
                                                   QUIC_LISTENER_EVENT* Event)
 {
-    WTF_UNUSED(Listener);
     wtf_server* server = (wtf_server*)Context;
 
     if (!server || !server->context) {
@@ -45,6 +74,7 @@ static QUIC_STATUS QUIC_API wtf_listener_callback(HQUIC Listener, void* Context,
 
             server->context->quic_api->SetCallbackHandler(Event->NEW_CONNECTION.Connection,
                                                           wtf_connection_callback, conn);
+            wtf_connection_add_ref(conn);
 
             QUIC_STATUS status = server->context->quic_api->ConnectionSetConfiguration(
                 Event->NEW_CONNECTION.Connection, server->configuration);
@@ -148,6 +178,18 @@ static void wtf_cleanup_server_cred_config(wtf_server* srv)
     srv->cred_config = NULL;
 }
 
+static void wtf_cleanup_server_config(wtf_server* srv)
+{
+    if (!srv) {
+        return;
+    }
+
+    if (srv->config.host) {
+        free((void*)srv->config.host);
+        srv->config.host = NULL;
+    }
+}
+
 wtf_result_t wtf_server_start(wtf_server_t* server)
 {
     if (!server) {
@@ -179,20 +221,20 @@ wtf_result_t wtf_server_start(wtf_server_t* server)
     }
 
     QUIC_ADDR address = {0};
-    QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
+    wtf_quic_addr_set_family(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
 
 
     if (srv->config.host) {
         if (inet_pton(AF_INET, srv->config.host, &((struct sockaddr_in*)&address)->sin_addr) == 1) {
-            QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_INET);
+            wtf_quic_addr_set_family(&address, QUIC_ADDRESS_FAMILY_INET);
         } else if (inet_pton(AF_INET6, srv->config.host,
                              &((struct sockaddr_in6*)&address)->sin6_addr)
                    == 1) {
-            QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_INET6);
+            wtf_quic_addr_set_family(&address, QUIC_ADDRESS_FAMILY_INET6);
         }
     }
 
-    QuicAddrSetPort(&address, srv->config.port);
+    wtf_quic_addr_set_port(&address, srv->config.port);
 
     const char* alpn = WTF_ALPN;
     QUIC_BUFFER alpn_buffer = {(uint32_t)strlen(alpn), (uint8_t*)alpn};
@@ -300,6 +342,14 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
     srv->config = *config;
     srv->state = WTF_SERVER_STOPPED;
 
+    if (config->host) {
+        srv->config.host = wtf_strdup(config->host);
+        if (!srv->config.host) {
+            result = WTF_ERROR_OUT_OF_MEMORY;
+            goto cleanup_server;
+        }
+    }
+
     connection_map_init(&srv->connections);
 
     if (mtx_init(&srv->mutex, mtx_plain) != thrd_success) {
@@ -310,6 +360,11 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
     if (mtx_init(&srv->connections_mutex, mtx_plain) != thrd_success) {
         result = WTF_ERROR_INTERNAL;
         goto cleanup_server_mutex;
+    }
+
+    if (cnd_init(&srv->connections_drained) != thrd_success) {
+        result = WTF_ERROR_INTERNAL;
+        goto cleanup_connections_mutex;
     }
 
     QUIC_SETTINGS settings = {0};
@@ -327,28 +382,51 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
     settings.IsSet.ServerResumptionLevel = TRUE;
     settings.DatagramReceiveEnabled = TRUE;
     settings.IsSet.DatagramReceiveEnabled = TRUE;
-    settings.PeerBidiStreamCount = 1000;
+    uint32_t peer_stream_count = config->max_streams_per_session > 0
+        ? config->max_streams_per_session
+        : WTF_DEFAULT_MAX_STREAMS_PER_SESSION;
+    settings.PeerBidiStreamCount = peer_stream_count;
     settings.IsSet.PeerBidiStreamCount = TRUE;
-    settings.PeerUnidiStreamCount = 20;
+    settings.PeerUnidiStreamCount = peer_stream_count;
     settings.IsSet.PeerUnidiStreamCount = TRUE;
     settings.SendBufferingEnabled = FALSE;
     settings.IsSet.SendBufferingEnabled = FALSE;
+#ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+    settings.ReliableResetEnabled = TRUE;
+    settings.IsSet.ReliableResetEnabled = TRUE;
+#endif
 
-    settings.StreamRecvWindowDefault = 64 * 1024;
+    uint32_t stream_recv_window = config->stream_recv_window > 0
+        ? config->stream_recv_window
+        : WTF_DEFAULT_STREAM_RECV_WINDOW;
+    uint64_t max_data_per_session = config->max_data_per_session > 0
+        ? config->max_data_per_session
+        : WTF_DEFAULT_MAX_DATA_PER_SESSION;
+    uint64_t conn_flow_control_window = config->conn_flow_control_window > 0
+        ? config->conn_flow_control_window
+        : max_data_per_session;
+    if (conn_flow_control_window < WTF_DEFAULT_CONN_FLOW_CONTROL_WINDOW) {
+        conn_flow_control_window = WTF_DEFAULT_CONN_FLOW_CONTROL_WINDOW;
+    }
+    if (conn_flow_control_window > UINT32_MAX) {
+        conn_flow_control_window = UINT32_MAX;
+    }
+
+    settings.StreamRecvWindowDefault = stream_recv_window;
     settings.IsSet.StreamRecvWindowDefault = TRUE;
-    settings.ConnFlowControlWindow = 1024 * 1024;
+    settings.ConnFlowControlWindow = (uint32_t)conn_flow_control_window;
     settings.IsSet.ConnFlowControlWindow = TRUE;
 
     if (config->cert_config == NULL) {
         WTF_LOG_ERROR(ctx, "server", "Certificate configuration is required");
         result = WTF_ERROR_INVALID_PARAMETER;
-        goto cleanup_connections_mutex;
+        goto cleanup_connections_drained;
     }
 
     srv->cred_config = malloc(sizeof(QUIC_CREDENTIAL_CONFIG));
     if (!srv->cred_config) {
         result = WTF_ERROR_OUT_OF_MEMORY;
-        goto cleanup_connections_mutex;
+        goto cleanup_connections_drained;
     }
 
     memset(srv->cred_config, 0, sizeof(QUIC_CREDENTIAL_CONFIG));
@@ -398,6 +476,8 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
                 result = WTF_ERROR_OUT_OF_MEMORY;
                 goto cleanup_cred_config;
             }
+            memset(srv->cred_config->CertificateFileProtected, 0,
+                   sizeof(QUIC_CERTIFICATE_FILE_PROTECTED));
 
             if (!config->cert_config->cert_data.protected_file.cert_path
                 || !config->cert_config->cert_data.protected_file.key_path
@@ -483,6 +563,7 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
                 result = WTF_ERROR_OUT_OF_MEMORY;
                 goto cleanup_cred_config;
             }
+            memset(srv->cred_config->CertificatePkcs12, 0, sizeof(QUIC_CERTIFICATE_PKCS12));
 
             if (!config->cert_config->cert_data.pkcs12.data
                 || config->cert_config->cert_data.pkcs12.data_size == 0) {
@@ -503,10 +584,14 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
                    config->cert_config->cert_data.pkcs12.data_size);
             srv->cred_config->CertificatePkcs12->Asn1BlobLength
                 = (uint32_t)config->cert_config->cert_data.pkcs12.data_size;
-            srv->cred_config->CertificatePkcs12->PrivateKeyPassword
-                = config->cert_config->cert_data.pkcs12.password
-                ? wtf_strdup(config->cert_config->cert_data.pkcs12.password)
-                : NULL;
+            if (config->cert_config->cert_data.pkcs12.password) {
+                srv->cred_config->CertificatePkcs12->PrivateKeyPassword = wtf_strdup(
+                    config->cert_config->cert_data.pkcs12.password);
+                if (!srv->cred_config->CertificatePkcs12->PrivateKeyPassword) {
+                    result = WTF_ERROR_OUT_OF_MEMORY;
+                    goto cleanup_cred_config;
+                }
+            }
             break;
 
         default:
@@ -518,10 +603,18 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
 
     if (config->cert_config->principal) {
         srv->cred_config->Principal = wtf_strdup(config->cert_config->principal);
+        if (!srv->cred_config->Principal) {
+            result = WTF_ERROR_OUT_OF_MEMORY;
+            goto cleanup_cred_config;
+        }
     }
 
     if (config->cert_config->ca_cert_file) {
         srv->cred_config->CaCertificateFile = wtf_strdup(config->cert_config->ca_cert_file);
+        if (!srv->cred_config->CaCertificateFile) {
+            result = WTF_ERROR_OUT_OF_MEMORY;
+            goto cleanup_cred_config;
+        }
         srv->cred_config->Flags |= QUIC_CREDENTIAL_FLAG_SET_CA_CERTIFICATE_FILE;
     }
 
@@ -558,6 +651,9 @@ cleanup_configuration:
 cleanup_cred_config:
     wtf_cleanup_server_cred_config(srv);
 
+cleanup_connections_drained:
+    cnd_destroy(&srv->connections_drained);
+
 cleanup_connections_mutex:
     mtx_destroy(&srv->connections_mutex);
 
@@ -566,6 +662,9 @@ cleanup_server_mutex:
 
 cleanup_connection_map:
     connection_map_cleanup(&srv->connections);
+
+cleanup_server:
+    wtf_cleanup_server_config(srv);
     free(srv);
 
 cleanup_unlock_context:
@@ -580,39 +679,89 @@ void wtf_server_destroy(wtf_server_t* server)
     }
 
     wtf_server* srv = server;
+    wtf_context* ctx = srv->context;
 
-    WTF_LOG_INFO(srv->context, "server", "Destroying WebTransport server");
+    WTF_LOG_INFO(ctx, "server", "Destroying WebTransport server");
 
     if (srv->state == WTF_SERVER_LISTENING) {
         wtf_server_stop(server);
     }
 
-    mtx_lock(&srv->context->mutex);
+    size_t connection_count = 0;
+    wtf_connection** connections = NULL;
 
     mtx_lock(&srv->connections_mutex);
-    for (connection_map_itr itr = connection_map_first(&srv->connections);
-         !connection_map_is_end(itr); itr = connection_map_next(itr)) {
-        wtf_connection* conn = itr.data->val;
-        if (conn->quic_connection) {
-            srv->context->quic_api->ConnectionShutdown(conn->quic_connection,
-                                                       QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+    srv->destroying = true;
+    connection_count = connection_map_size(&srv->connections);
+    if (connection_count > 0) {
+        connections = malloc(sizeof(*connections) * connection_count);
+        if (connections) {
+            size_t index = 0;
+            for (connection_map_itr itr = connection_map_first(&srv->connections);
+                 !connection_map_is_end(itr) && index < connection_count;
+                 itr = connection_map_next(itr)) {
+                wtf_connection* conn = itr.data->val;
+                wtf_connection_add_ref(conn);
+                connections[index++] = conn;
+            }
+            connection_count = index;
         }
     }
+    mtx_unlock(&srv->connections_mutex);
+
+    if (connections) {
+        for (size_t i = 0; i < connection_count; i++) {
+            wtf_connection* conn = connections[i];
+            HQUIC connection = conn->quic_connection;
+            if (connection && ctx && ctx->quic_api) {
+                ctx->quic_api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+                ctx->quic_api->ConnectionClose(connection);
+                conn->quic_connection = NULL;
+            }
+            wtf_connection_release(conn);
+        }
+        free(connections);
+    } else if (connection_count > 0) {
+        mtx_lock(&srv->connections_mutex);
+        while (connection_map_size(&srv->connections) > 0) {
+            cnd_wait(&srv->connections_drained, &srv->connections_mutex);
+        }
+        mtx_unlock(&srv->connections_mutex);
+    }
+
+    mtx_lock(&srv->connections_mutex);
+    while (connection_map_size(&srv->connections) > 0) {
+        connection_map_itr itr = connection_map_first(&srv->connections);
+        if (connection_map_is_end(itr)) {
+            break;
+        }
+        wtf_connection* conn = itr.data->val;
+        connection_map_erase(&srv->connections, conn->id);
+        wtf_connection_release(conn);
+    }
+
     connection_map_cleanup(&srv->connections);
     mtx_unlock(&srv->connections_mutex);
 
     if (srv->configuration) {
-        srv->context->quic_api->ConfigurationClose(srv->configuration);
+        ctx->quic_api->ConfigurationClose(srv->configuration);
+        srv->configuration = NULL;
     }
 
     wtf_cleanup_server_cred_config(srv);
+    wtf_cleanup_server_config(srv);
 
+    if (ctx) {
+        mtx_lock(&ctx->mutex);
+        if (ctx->server == srv) {
+            ctx->server = NULL;
+        }
+        mtx_unlock(&ctx->mutex);
+    }
+
+    cnd_destroy(&srv->connections_drained);
     mtx_destroy(&srv->connections_mutex);
     mtx_destroy(&srv->mutex);
-
-    srv->context->server = NULL;
-
-    mtx_unlock(&srv->context->mutex);
 
     free(server);
 }

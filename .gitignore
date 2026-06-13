@@ -10,6 +10,7 @@ CMakeFiles/
 CMakeScripts/
 Testing/
 Makefile
+!/Makefile
 cmake_install.cmake
 install_manifest.txt
 compile_commands.json
@@ -142,6 +143,10 @@ temp/
 *.backup
 
 # Python (if using Python scripts)
+.venv/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -165,6 +170,8 @@ gmon.out
 # Benchmark results
 bench_results/
 *.bench
+*.wad
+*.WAD
 
 # Fuzzing
 fuzz-*/

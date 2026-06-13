@@ -87,7 +87,7 @@ wtf_result_t wtf_quic_status_to_result(QUIC_STATUS status)
     }
 }
 
-uint32_t wtf_map_webtransport_error_to_h3(uint32_t wt_error)
+uint64_t wtf_map_webtransport_error_to_h3(uint32_t wt_error)
 {
     uint64_t base = WTF_WEBTRANSPORT_APPLICATION_ERROR_BASE;
     uint64_t mapped = base + wt_error + (wt_error / 0x1e);
@@ -96,7 +96,7 @@ uint32_t wtf_map_webtransport_error_to_h3(uint32_t wt_error)
         mapped = WTF_WEBTRANSPORT_APPLICATION_ERROR_MAX;
     }
 
-    return (uint32_t)mapped;
+    return mapped;
 }
 
 uint32_t wtf_map_h3_error_to_webtransport(uint64_t h3_error)
@@ -302,9 +302,9 @@ char* wtf_strndup(const char* s, size_t n)
     return y;
 }
 
-wtf_version_info_t* wtf_get_version()
+const wtf_version_info_t* wtf_get_version()
 {
-    static wtf_version_info_t version_info = {
+    static const wtf_version_info_t version_info = {
         .major = WTF_VERSION_MAJOR,
         .minor = WTF_VERSION_MINOR,
         .patch = WTF_VERSION_PATCH,
@@ -423,5 +423,133 @@ const char* wtf_http3_error_to_string(uint64_t http3_error)
 
 bool wtf_is_valid_application_error(uint32_t error_code)
 {
-    return (error_code >= 0x100 && error_code <= 0x3FFFFFFF);
+    uint64_t mapped = WTF_WEBTRANSPORT_APPLICATION_ERROR_BASE + (uint64_t)error_code
+        + ((uint64_t)error_code / 0x1eU);
+    return mapped <= WTF_WEBTRANSPORT_APPLICATION_ERROR_MAX;
+}
+
+wtf_result_t wtf_internal_send_context_create(size_t length, wtf_internal_send_context** send_ctx,
+                                              uint8_t** data)
+{
+    if (!send_ctx || !data || length > UINT32_MAX) {
+        return WTF_ERROR_INVALID_PARAMETER;
+    }
+
+    *send_ctx = NULL;
+    *data = NULL;
+
+    wtf_internal_send_context* ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        return WTF_ERROR_OUT_OF_MEMORY;
+    }
+
+    ctx->buffers = ctx->inline_buffers;
+    ctx->buffers_inline = true;
+    ctx->count = 1;
+    ctx->internal_send = true;
+
+    uint8_t* payload = NULL;
+    if (length <= WTF_INLINE_SEND_STORAGE) {
+        payload = ctx->inline_data;
+        ctx->owns_buffer_data = false;
+    } else {
+        payload = malloc(length);
+        if (!payload) {
+            free(ctx);
+            return WTF_ERROR_OUT_OF_MEMORY;
+        }
+        ctx->owns_buffer_data = true;
+    }
+
+    ctx->buffers[0].data = payload;
+    ctx->buffers[0].length = (uint32_t)length;
+
+    *send_ctx = ctx;
+    *data = payload;
+    return WTF_SUCCESS;
+}
+
+wtf_result_t wtf_internal_send_context_create_copy(const void* data, size_t length,
+                                                   wtf_internal_send_context** send_ctx)
+{
+    if ((!data && length > 0) || !send_ctx) {
+        return WTF_ERROR_INVALID_PARAMETER;
+    }
+
+    uint8_t* payload = NULL;
+    wtf_result_t result = wtf_internal_send_context_create(length, send_ctx, &payload);
+    if (result != WTF_SUCCESS) {
+        return result;
+    }
+
+    if (length > 0) {
+        memcpy(payload, data, length);
+    }
+    return WTF_SUCCESS;
+}
+
+wtf_result_t wtf_internal_send_context_take_buffer(uint8_t* data, size_t length,
+                                                   wtf_internal_send_context** send_ctx)
+{
+    if ((!data && length > 0) || !send_ctx || length > UINT32_MAX) {
+        return WTF_ERROR_INVALID_PARAMETER;
+    }
+
+    *send_ctx = NULL;
+
+    wtf_internal_send_context* ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        free(data);
+        return WTF_ERROR_OUT_OF_MEMORY;
+    }
+
+    ctx->buffers = ctx->inline_buffers;
+    ctx->buffers_inline = true;
+    ctx->count = 1;
+    ctx->internal_send = true;
+    ctx->buffers[0].length = (uint32_t)length;
+
+    if (length <= WTF_INLINE_SEND_STORAGE) {
+        if (length > 0) {
+            memcpy(ctx->inline_data, data, length);
+        }
+        free(data);
+        ctx->buffers[0].data = ctx->inline_data;
+        ctx->owns_buffer_data = false;
+    } else {
+        ctx->buffers[0].data = data;
+        ctx->owns_buffer_data = true;
+    }
+
+    *send_ctx = ctx;
+    return WTF_SUCCESS;
+}
+
+void wtf_internal_send_context_destroy(wtf_internal_send_context* send_ctx)
+{
+    if (!send_ctx) {
+        return;
+    }
+
+    if (send_ctx->buffers) {
+        uint32_t app_offset = send_ctx->app_buffer_offset;
+        if (app_offset > send_ctx->count) {
+            app_offset = send_ctx->count;
+        }
+
+        if (send_ctx->owns_buffer_data) {
+            for (uint32_t i = app_offset; i < send_ctx->count; i++) {
+                const uint8_t* payload = send_ctx->buffers[i].data;
+                if (payload && payload != send_ctx->inline_data) {
+                    free((void*)payload);
+                }
+            }
+        }
+
+        if (!send_ctx->buffers_inline) {
+            free(send_ctx->buffers);
+        }
+    }
+
+    free(send_ctx);
 }

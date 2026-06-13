@@ -72,12 +72,24 @@ void wtf_context_destroy(wtf_context_t* context)
 
     WTF_LOG_INFO(ctx, "context", "Destroying WebTransport context");
 
-    mtx_lock(&ctx->mutex);
+    wtf_server* server = NULL;
+    wtf_client* client = NULL;
 
-    if (ctx->server) {
-        wtf_server_destroy((wtf_server_t*)ctx->server);
-        ctx->server = NULL;
+    mtx_lock(&ctx->mutex);
+    server = ctx->server;
+    client = ctx->client;
+    ctx->server = NULL;
+    ctx->client = NULL;
+    mtx_unlock(&ctx->mutex);
+
+    if (server) {
+        wtf_server_destroy((wtf_server_t*)server);
     }
+    if (client) {
+        wtf_client_destroy((wtf_client_t*)client);
+    }
+
+    mtx_lock(&ctx->mutex);
 
     if (ctx->registration) {
         ctx->quic_api->RegistrationClose(ctx->registration);

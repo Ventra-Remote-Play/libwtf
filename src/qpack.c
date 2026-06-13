@@ -4,9 +4,10 @@
 #include "lsxpack_header.h"
 #include "utils.h"
 
-static void wtf_qpack_unblocked(void* context)
+#define WTF_MAX_CONNECT_HEADERS 256
+
+static void wtf_qpack_unblocked(void* context WTF_MAYBE_UNUSED)
 {
-    (void)context;
 }
 
 static struct lsxpack_header* wtf_qpack_prepare_decode(void* context, struct lsxpack_header* header,
@@ -18,8 +19,8 @@ static struct lsxpack_header* wtf_qpack_prepare_decode(void* context, struct lsx
         return NULL;
 
     if (space > sizeof(ctx->decode_buffer)) {
-        if (ctx->connection && ctx->connection->server && ctx->connection->server->context) {
-            WTF_LOG_ERROR(ctx->connection->server->context, "qpack", "Header too large: %zu bytes",
+        if (ctx->connection && ctx->connection->context) {
+            WTF_LOG_ERROR(ctx->connection->context, "qpack", "Header too large: %zu bytes",
                           space);
         }
         return NULL;
@@ -38,9 +39,7 @@ static struct lsxpack_header* wtf_qpack_prepare_decode(void* context, struct lsx
 
 static wtf_context* get_log_context(wtf_header_decode_context* ctx)
 {
-    return (ctx && ctx->connection && ctx->connection->server)
-        ? ctx->connection->server->context
-        : NULL;
+    return (ctx && ctx->connection) ? ctx->connection->context : NULL;
 }
 
 static bool validate_header_size(wtf_header_decode_context* ctx, size_t name_len, size_t value_len)
@@ -56,45 +55,352 @@ static bool validate_header_size(wtf_header_decode_context* ctx, size_t name_len
     return true;
 }
 
-static void update_request_field(char** field, const char* value, size_t value_len)
+static bool update_request_field(char** field, const char* value, size_t value_len)
 {
+    char* copy = wtf_strndup(value, value_len);
+    if (!copy) {
+        return false;
+    }
+
     if (*field) {
         free(*field);
     }
-    *field = wtf_strndup(value, value_len);
+    *field = copy;
+    return true;
 }
 
-static void process_pseudo_header(wtf_connect_request* request, const char* name, size_t name_len,
-                                  const char* value, size_t value_len, wtf_context* log_ctx)
+static bool wtf_connect_request_add_header(wtf_connect_request* request, const char* name,
+                                           size_t name_len, const char* value, size_t value_len,
+                                           wtf_context* log_ctx);
+
+static bool update_pseudo_field(wtf_header_decode_context* ctx, char** field, bool* seen,
+                                const char* field_name, const char* value, size_t value_len,
+                                wtf_context* log_ctx)
 {
+    if (*seen) {
+        if (log_ctx) {
+            WTF_LOG_ERROR(log_ctx, "qpack", "Duplicate pseudo-header: %s", field_name);
+        }
+        ctx->malformed_header_block = true;
+        return false;
+    }
+
+    *seen = true;
+    return update_request_field(field, value, value_len);
+}
+
+static bool process_pseudo_header(wtf_header_decode_context* ctx, const char* name,
+                                  size_t name_len, const char* value, size_t value_len,
+                                  wtf_context* log_ctx)
+{
+    wtf_connect_request* request = ctx->request;
+
     if (name_len == 7 && strncmp(name, ":method", 7) == 0) {
-        update_request_field(&request->method, value, value_len);
+        return update_pseudo_field(ctx, &request->method, &ctx->seen_method, ":method", value,
+                                   value_len, log_ctx);
     } else if (name_len == 7 && strncmp(name, ":scheme", 7) == 0) {
-        update_request_field(&request->scheme, value, value_len);
+        return update_pseudo_field(ctx, &request->scheme, &ctx->seen_scheme, ":scheme", value,
+                                   value_len, log_ctx);
     } else if (name_len == 10 && strncmp(name, ":authority", 10) == 0) {
-        update_request_field(&request->authority, value, value_len);
+        return update_pseudo_field(ctx, &request->authority, &ctx->seen_authority, ":authority",
+                                   value, value_len, log_ctx);
     } else if (name_len == 5 && strncmp(name, ":path", 5) == 0) {
-        update_request_field(&request->path, value, value_len);
+        return update_pseudo_field(ctx, &request->path, &ctx->seen_path, ":path", value,
+                                   value_len, log_ctx);
     } else if (name_len == 9 && strncmp(name, ":protocol", 9) == 0) {
-        update_request_field(&request->protocol, value, value_len);
-    } else {
-        if (log_ctx) {
-            WTF_LOG_DEBUG(log_ctx, "qpack", "Ignoring unknown pseudo-header: %.*s", (int)name_len,
-                          name);
-        }
+        return update_pseudo_field(ctx, &request->protocol, &ctx->seen_protocol, ":protocol",
+                                   value, value_len, log_ctx);
     }
+
+    if (log_ctx) {
+        WTF_LOG_ERROR(log_ctx, "qpack", "Unknown pseudo-header: %.*s", (int)name_len, name);
+    }
+    ctx->malformed_header_block = true;
+    return false;
 }
 
-static void process_regular_header(wtf_connect_request* request, const char* name, size_t name_len,
-                                   const char* value, size_t value_len, wtf_context* log_ctx)
+static bool validate_no_late_pseudo_header(wtf_header_decode_context* ctx, const char* name,
+                                           size_t name_len, wtf_context* log_ctx)
 {
-    if (name_len == 6 && strncmp(name, "origin", 6) == 0) {
-        update_request_field(&request->origin, value, value_len);
-    } else {
+    if (ctx->seen_regular_header) {
         if (log_ctx) {
-            WTF_LOG_DEBUG(log_ctx, "qpack", "Ignoring regular header: %.*s", (int)name_len, name);
+            WTF_LOG_ERROR(log_ctx, "qpack", "Pseudo-header after regular header: %.*s",
+                          (int)name_len, name);
+        }
+        ctx->malformed_header_block = true;
+        return false;
+    }
+    return true;
+}
+
+static bool validate_regular_header_name(const char* name, size_t name_len, wtf_context* log_ctx)
+{
+    for (size_t i = 0; i < name_len; i++) {
+        if (name[i] == ':') {
+            if (log_ctx) {
+                WTF_LOG_ERROR(log_ctx, "qpack", "Invalid regular header name: %.*s",
+                              (int)name_len, name);
+            }
+            return false;
+        }
+        if (name[i] >= 'A' && name[i] <= 'Z') {
+            if (log_ctx) {
+                WTF_LOG_ERROR(log_ctx, "qpack", "Uppercase field name is malformed: %.*s",
+                              (int)name_len, name);
+            }
+            return false;
         }
     }
+    return true;
+}
+
+static bool process_regular_header(wtf_header_decode_context* ctx, const char* name,
+                                   size_t name_len, const char* value, size_t value_len,
+                                   wtf_context* log_ctx)
+{
+    wtf_connect_request* request = ctx->request;
+
+    if (!validate_regular_header_name(name, name_len, log_ctx)) {
+        ctx->malformed_header_block = true;
+        return false;
+    }
+
+    ctx->seen_regular_header = true;
+
+    if (!wtf_connect_request_add_header(request, name, name_len, value, value_len, log_ctx)) {
+        return false;
+    }
+
+    if (name_len == 6 && strncmp(name, "origin", 6) == 0) {
+        if (request->origin) {
+            if (log_ctx) {
+                WTF_LOG_ERROR(log_ctx, "qpack", "Duplicate origin header");
+            }
+            ctx->malformed_header_block = true;
+            return false;
+        }
+        return update_request_field(&request->origin, value, value_len);
+    }
+
+    return true;
+}
+
+static bool process_header_name(wtf_header_decode_context* ctx, const char* name, size_t name_len,
+                                const char* value, size_t value_len, wtf_context* log_ctx)
+{
+    if (name[0] == ':') {
+        if (!validate_no_late_pseudo_header(ctx, name, name_len, log_ctx)) {
+            return false;
+        }
+        return process_pseudo_header(ctx, name, name_len, value, value_len, log_ctx);
+    }
+
+    return process_regular_header(ctx, name, name_len, value, value_len, log_ctx);
+}
+
+static bool validate_required_connect_headers(wtf_context* ctx, wtf_connect_request* request)
+{
+    if (!request->method || strcmp(request->method, WTF_CONNECT_METHOD) != 0) {
+        WTF_LOG_ERROR(ctx, "qpack", "Invalid or missing :method header");
+        return false;
+    }
+    if (!request->protocol || request->protocol[0] == '\0') {
+        WTF_LOG_ERROR(ctx, "qpack", "Missing :protocol header");
+        return false;
+    }
+    if (!request->scheme || request->scheme[0] == '\0') {
+        WTF_LOG_ERROR(ctx, "qpack", "Missing :scheme header");
+        return false;
+    }
+    if (!request->authority || request->authority[0] == '\0') {
+        WTF_LOG_ERROR(ctx, "qpack", "Missing :authority header");
+        return false;
+    }
+    if (!request->path || request->path[0] == '\0') {
+        WTF_LOG_ERROR(ctx, "qpack", "Missing :path header");
+        return false;
+    }
+    return true;
+}
+
+static bool wtf_connect_request_add_header(wtf_connect_request* request, const char* name,
+                                           size_t name_len, const char* value, size_t value_len,
+                                           wtf_context* log_ctx)
+{
+    if (request->header_count >= WTF_MAX_CONNECT_HEADERS) {
+        if (log_ctx) {
+            WTF_LOG_ERROR(log_ctx, "qpack", "Too many CONNECT request headers");
+        }
+        return false;
+    }
+
+    if (request->header_count == request->header_capacity) {
+        size_t new_capacity = request->header_capacity == 0 ? 8 : request->header_capacity * 2;
+        if (new_capacity > WTF_MAX_CONNECT_HEADERS) {
+            new_capacity = WTF_MAX_CONNECT_HEADERS;
+        }
+
+        wtf_http_header_t* headers = realloc(request->headers, new_capacity * sizeof(*headers));
+        if (!headers) {
+            if (log_ctx) {
+                WTF_LOG_ERROR(log_ctx, "qpack", "Failed to grow CONNECT header list");
+            }
+            return false;
+        }
+
+        request->headers = headers;
+        request->header_capacity = new_capacity;
+    }
+
+    char* header_name = wtf_strndup(name, name_len);
+    char* header_value = wtf_strndup(value, value_len);
+    if (!header_name || !header_value) {
+        free(header_name);
+        free(header_value);
+        if (log_ctx) {
+            WTF_LOG_ERROR(log_ctx, "qpack", "Failed to copy CONNECT header");
+        }
+        return false;
+    }
+
+    request->headers[request->header_count++] = (wtf_http_header_t){
+        .name = header_name,
+        .value = header_value,
+    };
+    return true;
+}
+
+static bool wtf_connect_response_add_header(wtf_connect_response* response, const char* name,
+                                            size_t name_len, const char* value, size_t value_len,
+                                            wtf_context* log_ctx)
+{
+    if (response->header_count >= WTF_MAX_CONNECT_HEADERS) {
+        if (log_ctx) {
+            WTF_LOG_ERROR(log_ctx, "qpack", "Too many CONNECT response headers");
+        }
+        return false;
+    }
+
+    if (response->header_count == response->header_capacity) {
+        size_t new_capacity = response->header_capacity == 0 ? 8 : response->header_capacity * 2;
+        if (new_capacity > WTF_MAX_CONNECT_HEADERS) {
+            new_capacity = WTF_MAX_CONNECT_HEADERS;
+        }
+
+        wtf_http_header_t* headers = realloc(response->headers, new_capacity * sizeof(*headers));
+        if (!headers) {
+            if (log_ctx) {
+                WTF_LOG_ERROR(log_ctx, "qpack", "Failed to grow CONNECT response header list");
+            }
+            return false;
+        }
+
+        response->headers = headers;
+        response->header_capacity = new_capacity;
+    }
+
+    char* header_name = wtf_strndup(name, name_len);
+    char* header_value = wtf_strndup(value, value_len);
+    if (!header_name || !header_value) {
+        free(header_name);
+        free(header_value);
+        if (log_ctx) {
+            WTF_LOG_ERROR(log_ctx, "qpack", "Failed to copy CONNECT response header");
+        }
+        return false;
+    }
+
+    response->headers[response->header_count++] = (wtf_http_header_t){
+        .name = header_name,
+        .value = header_value,
+    };
+    return true;
+}
+
+static bool parse_status_code(const char* value, size_t value_len, uint16_t* status_code)
+{
+    if (!value || !status_code || value_len != 3) {
+        return false;
+    }
+
+    uint16_t code = 0;
+    for (size_t i = 0; i < value_len; i++) {
+        if (value[i] < '0' || value[i] > '9') {
+            return false;
+        }
+        code = (uint16_t)(code * 10 + (uint16_t)(value[i] - '0'));
+    }
+
+    if (code < 100 || code > 599) {
+        return false;
+    }
+
+    *status_code = code;
+    return true;
+}
+
+static bool process_response_header(wtf_header_decode_context* ctx, const char* name,
+                                    size_t name_len, const char* value, size_t value_len,
+                                    wtf_context* log_ctx)
+{
+    wtf_connect_response* response = ctx->response;
+
+    if (name[0] == ':') {
+        if (!validate_no_late_pseudo_header(ctx, name, name_len, log_ctx)) {
+            return false;
+        }
+
+        if (name_len == 7 && strncmp(name, ":status", 7) == 0) {
+            if (ctx->seen_status) {
+                if (log_ctx) {
+                    WTF_LOG_ERROR(log_ctx, "qpack", "Duplicate pseudo-header: :status");
+                }
+                ctx->malformed_header_block = true;
+                return false;
+            }
+            ctx->seen_status = true;
+            if (!parse_status_code(value, value_len, &response->status_code)) {
+                if (log_ctx) {
+                    WTF_LOG_ERROR(log_ctx, "qpack", "Invalid :status value");
+                }
+                ctx->malformed_header_block = true;
+                return false;
+            }
+            return true;
+        }
+
+        if (log_ctx) {
+            WTF_LOG_ERROR(log_ctx, "qpack", "Unknown response pseudo-header: %.*s",
+                          (int)name_len, name);
+        }
+        ctx->malformed_header_block = true;
+        return false;
+    }
+
+    if (!validate_regular_header_name(name, name_len, log_ctx)) {
+        ctx->malformed_header_block = true;
+        return false;
+    }
+
+    ctx->seen_regular_header = true;
+
+    if (!wtf_connect_response_add_header(response, name, name_len, value, value_len, log_ctx)) {
+        return false;
+    }
+
+    if (name_len == 28 && strncmp(name, "sec-webtransport-http3-draft", 28) == 0) {
+        if (response->draft_header) {
+            if (log_ctx) {
+                WTF_LOG_ERROR(log_ctx, "qpack", "Duplicate draft response header");
+            }
+            ctx->malformed_header_block = true;
+            return false;
+        }
+        response->draft_header = wtf_strndup(value, value_len);
+        return response->draft_header != NULL;
+    }
+
+    return true;
 }
 
 static int wtf_qpack_process_header(void* context, struct lsxpack_header* header)
@@ -105,8 +411,11 @@ static int wtf_qpack_process_header(void* context, struct lsxpack_header* header
         return -1;
     }
 
-    wtf_connect_request* request = ctx->request;
-    if (!request) {
+    if (ctx->decode_response) {
+        if (!ctx->response) {
+            return -1;
+        }
+    } else if (!ctx->request) {
         return -1;
     }
 
@@ -137,10 +446,11 @@ static int wtf_qpack_process_header(void* context, struct lsxpack_header* header
                       (int)value_len, value);
     }
 
-    if (name[0] == ':') {
-        process_pseudo_header(request, name, name_len, value, value_len, log_ctx);
-    } else {
-        process_regular_header(request, name, name_len, value, value_len, log_ctx);
+    bool success = ctx->decode_response
+        ? process_response_header(ctx, name, name_len, value, value_len, log_ctx)
+        : process_header_name(ctx, name, name_len, value, value_len, log_ctx);
+    if (!success) {
+        return -1;
     }
 
     ctx->header_count++;
@@ -297,6 +607,45 @@ cleanup:
     return success;
 }
 
+void wtf_connect_request_cleanup(wtf_connect_request* request)
+{
+    if (!request) {
+        return;
+    }
+
+    free(request->method);
+    free(request->protocol);
+    free(request->scheme);
+    free(request->authority);
+    free(request->path);
+    free(request->origin);
+
+    for (size_t i = 0; i < request->header_count; i++) {
+        free((void*)request->headers[i].name);
+        free((void*)request->headers[i].value);
+    }
+    free(request->headers);
+
+    memset(request, 0, sizeof(*request));
+}
+
+void wtf_connect_response_cleanup(wtf_connect_response* response)
+{
+    if (!response) {
+        return;
+    }
+
+    free(response->draft_header);
+
+    for (size_t i = 0; i < response->header_count; i++) {
+        free((void*)response->headers[i].name);
+        free((void*)response->headers[i].value);
+    }
+    free(response->headers);
+
+    memset(response, 0, sizeof(*response));
+}
+
 wtf_result_t wtf_qpack_parse_connect_headers(wtf_context* ctx, wtf_http3_stream* stream,
                                              const uint8_t* data, size_t data_len,
                                              wtf_connect_request* request)
@@ -347,18 +696,10 @@ wtf_result_t wtf_qpack_parse_connect_headers(wtf_context* ctx, wtf_http3_stream*
             WTF_LOG_DEBUG(ctx, "qpack", "Headers decoded successfully, %zu headers processed",
                           decode_ctx.header_count);
 
-            // Validate required CONNECT headers
-            if (!request->method || strncmp(request->method, "CONNECT", 8) != 0) {
-                WTF_LOG_ERROR(ctx, "qpack", "Invalid or missing :method header");
+            if (decode_ctx.malformed_header_block) {
+                WTF_LOG_ERROR(ctx, "qpack", "Malformed CONNECT header block");
                 result = WTF_ERROR_PROTOCOL_VIOLATION;
-            } else if (!request->protocol) {
-                WTF_LOG_ERROR(ctx, "qpack", "Missing :protocol header");
-                result = WTF_ERROR_PROTOCOL_VIOLATION;
-            } else if (!request->scheme) {
-                WTF_LOG_ERROR(ctx, "qpack", "Missing :scheme header");
-                result = WTF_ERROR_PROTOCOL_VIOLATION;
-            } else if (!request->authority) {
-                WTF_LOG_ERROR(ctx, "qpack", "Missing :authority header");
+            } else if (!validate_required_connect_headers(ctx, request)) {
                 result = WTF_ERROR_PROTOCOL_VIOLATION;
             } else {
                 request->valid = true;
@@ -391,79 +732,93 @@ wtf_result_t wtf_qpack_parse_connect_headers(wtf_context* ctx, wtf_http3_stream*
 
     // Cleanup on error
     if (result != WTF_SUCCESS) {
-        if (request->method) {
-            free(request->method);
-            request->method = NULL;
-        }
-        if (request->protocol) {
-            free(request->protocol);
-            request->protocol = NULL;
-        }
-        if (request->scheme) {
-            free(request->scheme);
-            request->scheme = NULL;
-        }
-        if (request->authority) {
-            free(request->authority);
-            request->authority = NULL;
-        }
-        if (request->path) {
-            free(request->path);
-            request->path = NULL;
-        }
-        if (request->origin) {
-            free(request->origin);
-            request->origin = NULL;
-        }
-        request->valid = false;
+        wtf_connect_request_cleanup(request);
     }
 
     return result;
 }
 
-wtf_result_t wtf_qpack_send_encoder_data(wtf_connection* conn)
+wtf_result_t wtf_qpack_parse_response_headers(wtf_context* ctx, wtf_http3_stream* stream,
+                                              const uint8_t* data, size_t data_len,
+                                              wtf_connect_response* response)
 {
-    if (!conn || !conn->qpack.initialized || !conn->peer_encoder_stream) {
+    if (!ctx || !stream || !data || !response || !stream->connection) {
         return WTF_ERROR_INVALID_PARAMETER;
     }
-    wtf_context* ctx = conn->server->context;
+
+    wtf_connection* conn = stream->connection;
+
+    WTF_LOG_DEBUG(ctx, "qpack", "Parsing CONNECT response headers: %zu bytes", data_len);
+    memset(response, 0, sizeof(*response));
+    response->valid = false;
+
+    wtf_header_decode_context decode_ctx = {0};
+    decode_ctx.response = response;
+    decode_ctx.connection = conn;
+    decode_ctx.decode_response = true;
 
     mtx_lock(&conn->qpack.mutex);
-    if (!conn->qpack.initialized || conn->qpack.tsu_buf_sz == 0) {
+
+    if (!conn->qpack.initialized) {
         mtx_unlock(&conn->qpack.mutex);
+        WTF_LOG_ERROR(ctx, "qpack", "QPACK not initialized");
         return WTF_ERROR_INVALID_STATE;
     }
 
-    size_t total_size = sizeof(QUIC_BUFFER) + conn->qpack.tsu_buf_sz;
-    void* send_buffer_raw = malloc(total_size);
-    if (!send_buffer_raw) {
-        WTF_LOG_ERROR(ctx, "qpack", "Failed to allocate encoder send buffer");
-        mtx_unlock(&conn->qpack.mutex);
-        return WTF_ERROR_OUT_OF_MEMORY;
-    }
+    struct lsqpack_dec* decoder = &conn->qpack.decoder;
+    const uint8_t* header_data = data;
+    uint64_t stream_id = stream->id;
 
-    QUIC_BUFFER* send_buffer = (QUIC_BUFFER*)send_buffer_raw;
-    uint8_t* data = (uint8_t*)send_buffer_raw + sizeof(QUIC_BUFFER);
-
-    memcpy(data, conn->qpack.tsu_buf, conn->qpack.tsu_buf_sz);
-    send_buffer->Buffer = data;
-    send_buffer->Length = (uint32_t)conn->qpack.tsu_buf_sz;
-
-    conn->qpack.tsu_buf_sz = 0;
+    enum lsqpack_read_header_status decode_result = lsqpack_dec_header_in(
+        decoder, &decode_ctx, stream_id, data_len, &header_data, data_len, NULL, NULL);
 
     mtx_unlock(&conn->qpack.mutex);
 
-    size_t bytes_to_send = send_buffer->Length;
+    wtf_result_t result = WTF_SUCCESS;
 
-    QUIC_STATUS status = ctx->quic_api->StreamSend(
-        conn->peer_encoder_stream->quic_stream, send_buffer, 1, QUIC_SEND_FLAG_NONE,
-        send_buffer_raw);
+    switch (decode_result) {
+        case LQRHS_DONE:
+            if (decode_ctx.malformed_header_block) {
+                WTF_LOG_ERROR(ctx, "qpack", "Malformed CONNECT response header block");
+                result = WTF_ERROR_PROTOCOL_VIOLATION;
+            } else if (!decode_ctx.seen_status) {
+                WTF_LOG_ERROR(ctx, "qpack", "Missing :status response header");
+                result = WTF_ERROR_PROTOCOL_VIOLATION;
+            } else {
+                response->valid = true;
+                WTF_LOG_DEBUG(ctx, "qpack", "CONNECT response status: %u",
+                              response->status_code);
+            }
+            break;
 
-    if (QUIC_SUCCEEDED(status)) {
-        WTF_LOG_TRACE(ctx, "qpack", "Sent %zu bytes of encoder data", bytes_to_send);
-    } else {
-        WTF_LOG_ERROR(ctx, "qpack", "Failed to send encoder data: 0x%x", status);
-        free(send_buffer_raw);
+        case LQRHS_BLOCKED:
+            WTF_LOG_DEBUG(ctx, "qpack", "Response header block blocked");
+            result = WTF_ERROR_PROTOCOL_VIOLATION;
+            break;
+
+        case LQRHS_NEED:
+            WTF_LOG_ERROR(ctx, "qpack", "Incomplete response header block");
+            result = WTF_ERROR_PROTOCOL_VIOLATION;
+            break;
+
+        case LQRHS_ERROR:
+        default: {
+            WTF_LOG_ERROR(ctx, "qpack", "Response header decoding error: %d", decode_result);
+            const struct lsqpack_dec_err* err = lsqpack_dec_get_err_info(decoder);
+            if (err) {
+                WTF_LOG_ERROR(ctx, "qpack",
+                              "QPACK decoder error detail: type=%d line=%d off=%llu stream=%llu",
+                              (int)err->type, err->line, (unsigned long long)err->off,
+                              (unsigned long long)err->stream_id);
+            }
+            result = WTF_ERROR_PROTOCOL_VIOLATION;
+            break;
+        }
     }
-    return wtf_quic_status_to_result(status);
+
+    if (result != WTF_SUCCESS) {
+        wtf_connect_response_cleanup(response);
+    }
+
+    return result;
 }

@@ -51,10 +51,14 @@ uint8_t* wtf_varint_encode_2bytes(wtf_varint_t value, uint8_t* buffer)
     return buffer + sizeof(uint16_t);
 }
 
-bool wtf_varint_decode(uint16_t buffer_length, const uint8_t* buffer, uint16_t* offset,
+bool wtf_varint_decode(size_t buffer_length, const uint8_t* buffer, size_t* offset,
                        wtf_varint_t* value)
 {
-    if (buffer_length < sizeof(uint8_t) + *offset) {
+    if (!buffer || !offset || !value) {
+        return false;
+    }
+
+    if (*offset > buffer_length || buffer_length - *offset < sizeof(uint8_t)) {
         return false;
     }
 
@@ -62,14 +66,14 @@ bool wtf_varint_decode(uint16_t buffer_length, const uint8_t* buffer, uint16_t* 
         *value = buffer[*offset];
         *offset += sizeof(uint8_t);
     } else if (buffer[*offset] < 0x80) {
-        if (buffer_length < sizeof(uint16_t) + *offset) {
+        if (buffer_length - *offset < sizeof(uint16_t)) {
             return false;
         }
         *value = ((uint64_t)(buffer[*offset] & 0x3fUL)) << 8;
         *value |= buffer[*offset + 1];
         *offset += sizeof(uint16_t);
     } else if (buffer[*offset] < 0xc0) {
-        if (buffer_length < sizeof(uint32_t) + *offset) {
+        if (buffer_length - *offset < sizeof(uint32_t)) {
             return false;
         }
         uint32_t v;
@@ -77,7 +81,7 @@ bool wtf_varint_decode(uint16_t buffer_length, const uint8_t* buffer, uint16_t* 
         *value = CxPlatByteSwapUint32(v) & 0x3fffffffUL;
         *offset += sizeof(uint32_t);
     } else {
-        if (buffer_length < sizeof(uint64_t) + *offset) {
+        if (buffer_length - *offset < sizeof(uint64_t)) {
             return false;
         }
         uint64_t v;

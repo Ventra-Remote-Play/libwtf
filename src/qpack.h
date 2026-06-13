@@ -21,12 +21,16 @@ bool wtf_qpack_process_decoder(wtf_context* ctx, wtf_qpack_context* qpack, const
 bool wtf_qpack_process_encoder(wtf_context* ctx, wtf_qpack_context* qpack, const uint8_t* data,
                                size_t length);
 
-wtf_result_t wtf_qpack_send_encoder_data(wtf_connection* conn);
-
 wtf_result_t wtf_qpack_parse_connect_headers(wtf_context* ctx, wtf_http3_stream* stream,
                                              const uint8_t* data, size_t data_len,
                                              wtf_connect_request* request);
 
+wtf_result_t wtf_qpack_parse_response_headers(wtf_context* ctx, wtf_http3_stream* stream,
+                                              const uint8_t* data, size_t data_len,
+                                              wtf_connect_response* response);
+
+void wtf_connect_request_cleanup(wtf_connect_request* request);
+void wtf_connect_response_cleanup(wtf_connect_response* response);
 
 #ifdef __cplusplus
 }

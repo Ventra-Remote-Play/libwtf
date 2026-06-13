@@ -17,12 +17,10 @@ void wtf_log_internal(wtf_context* ctx, wtf_log_level_t level, const char* compo
 
     #define WTF_LOG(ctx, level, component, ...)                                                    \
         do {                                                                                       \
-            if (level < (ctx)->log_level) {                                                        \
-                (void)(ctx);                                                                       \
-                (void)(level);                                                                     \
-                (void)(component);                                                                 \
-            } else if ((ctx) && (ctx)->log_callback && (level) >= (ctx)->log_level) {              \
-                wtf_log_internal(ctx, level, component, __FILE__, __LINE__, __VA_ARGS__);          \
+            wtf_context* wtf_log_ctx_ = (ctx);                                                     \
+            if (wtf_log_ctx_ && wtf_log_ctx_->log_callback                                         \
+                && (level) >= wtf_log_ctx_->log_level) {                                           \
+                wtf_log_internal(wtf_log_ctx_, level, component, __FILE__, __LINE__, __VA_ARGS__); \
             }                                                                                      \
         } while (0)
 
@@ -41,42 +39,13 @@ void wtf_log_internal(wtf_context* ctx, wtf_log_level_t level, const char* compo
 
 #else
 
-    #define WTF_LOG(ctx, level, component, ...)                                                    \
-        do {                                                                                       \
-            (void)(ctx);                                                                           \
-            (void)(level);                                                                         \
-            (void)(component);                                                                     \
-        } while (0)
-    #define WTF_LOG_TRACE(ctx, component, ...)                                                     \
-        do {                                                                                       \
-            (void)(ctx);                                                                           \
-            (void)(component);                                                                     \
-        } while (0)
-    #define WTF_LOG_DEBUG(ctx, component, ...)                                                     \
-        do {                                                                                       \
-            (void)(ctx);                                                                           \
-            (void)(component);                                                                     \
-        } while (0)
-    #define WTF_LOG_INFO(ctx, component, ...)                                                      \
-        do {                                                                                       \
-            (void)(ctx);                                                                           \
-            (void)(component);                                                                     \
-        } while (0)
-    #define WTF_LOG_WARN(ctx, component, ...)                                                      \
-        do {                                                                                       \
-            (void)(ctx);                                                                           \
-            (void)(component);                                                                     \
-        } while (0)
-    #define WTF_LOG_ERROR(ctx, component, ...)                                                     \
-        do {                                                                                       \
-            (void)(ctx);                                                                           \
-            (void)(component);                                                                     \
-        } while (0)
-    #define WTF_LOG_CRITICAL(ctx, component, ...)                                                  \
-        do {                                                                                       \
-            (void)(ctx);                                                                           \
-            (void)(component);                                                                     \
-        } while (0)
+    #define WTF_LOG(ctx, level, component, ...) do { } while (0)
+    #define WTF_LOG_TRACE(ctx, component, ...) do { } while (0)
+    #define WTF_LOG_DEBUG(ctx, component, ...) do { } while (0)
+    #define WTF_LOG_INFO(ctx, component, ...) do { } while (0)
+    #define WTF_LOG_WARN(ctx, component, ...) do { } while (0)
+    #define WTF_LOG_ERROR(ctx, component, ...) do { } while (0)
+    #define WTF_LOG_CRITICAL(ctx, component, ...) do { } while (0)
 
 #endif
 
