@@ -714,8 +714,12 @@ WTF_API void wtf_session_set_callback(wtf_session_t* session, wtf_session_callba
                                       void* user_context);
 
 //! Get the maximum datagram payload size currently accepted for a session.
+//! The value is derived from the negotiated QUIC datagram send limit minus libwtf's per-session
+//! datagram prefix. It can differ between sessions on the same connection when the encoded session
+//! id length differs.
 //! @param session target session
-//! @return maximum datagram payload size in bytes, or 0 when unavailable
+//! @return maximum datagram payload size in bytes, or 0 when datagrams are unavailable or not yet
+//! sendable
 WTF_API uint32_t wtf_session_get_max_datagram_size(wtf_session_t* session);
 
 //! Open a new stream on a session

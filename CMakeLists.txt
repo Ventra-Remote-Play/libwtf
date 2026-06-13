@@ -193,11 +193,19 @@ else()
         add_compile_options(-Wno-invalid-unevaluated-string)
     endif()
 
+    set(WTF_MSQUIC_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/msquic)
+
     if(WTF_APPLY_BUNDLED_MSQUIC_PATCHES)
         find_package(Git QUIET)
         if(NOT Git_FOUND)
             message(FATAL_ERROR "Git is required to apply bundled MsQuic patches")
         endif()
+
+        set(WTF_MSQUIC_SOURCE_DIR ${CMAKE_CURRENT_BINARY_DIR}/_deps/msquic-patched-src)
+        file(REMOVE_RECURSE ${WTF_MSQUIC_SOURCE_DIR})
+        file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/msquic/
+             DESTINATION ${WTF_MSQUIC_SOURCE_DIR}
+             PATTERN ".git" EXCLUDE)
 
         set(WTF_BUNDLED_MSQUIC_PATCHES
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/msquic/reliable-reset-draft07.patch
@@ -206,7 +214,7 @@ else()
         foreach(WTF_BUNDLED_MSQUIC_PATCH IN LISTS WTF_BUNDLED_MSQUIC_PATCHES)
             execute_process(
                 COMMAND ${GIT_EXECUTABLE} apply --check ${WTF_BUNDLED_MSQUIC_PATCH}
-                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/msquic
+                WORKING_DIRECTORY ${WTF_MSQUIC_SOURCE_DIR}
                 RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY
                 OUTPUT_QUIET
                 ERROR_QUIET
@@ -215,7 +223,7 @@ else()
             if(WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY EQUAL 0)
                 execute_process(
                     COMMAND ${GIT_EXECUTABLE} apply ${WTF_BUNDLED_MSQUIC_PATCH}
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/msquic
+                    WORKING_DIRECTORY ${WTF_MSQUIC_SOURCE_DIR}
                     RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_RESULT
                 )
                 if(NOT WTF_BUNDLED_MSQUIC_PATCH_RESULT EQUAL 0)
@@ -225,7 +233,7 @@ else()
             else()
                 execute_process(
                     COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${WTF_BUNDLED_MSQUIC_PATCH}
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/msquic
+                    WORKING_DIRECTORY ${WTF_MSQUIC_SOURCE_DIR}
                     RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_ALREADY_APPLIED
                     OUTPUT_QUIET
                     ERROR_QUIET
@@ -242,7 +250,7 @@ else()
         endforeach()
     endif()
     
-    add_subdirectory(msquic)
+    add_subdirectory(${WTF_MSQUIC_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/_deps/msquic-build)
     
     if(TARGET msquic)
         if(CMAKE_CONFIGURATION_TYPES)

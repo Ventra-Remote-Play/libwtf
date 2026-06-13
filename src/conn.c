@@ -199,7 +199,8 @@ static wtf_connection* wtf_connection_create_common(wtf_context* context, HQUIC 
         : WTF_DEFAULT_MAX_STREAMS_PER_SESSION;
     conn->max_data_per_session = max_data_per_session > 0 ? max_data_per_session
                                                           : WTF_DEFAULT_MAX_DATA_PER_SESSION;
-    conn->max_datagram_size = WTF_MAX_DATAGRAM_SIZE;
+    atomic_init(&conn->datagram_send_enabled, false);
+    atomic_init(&conn->max_datagram_size, 0);
 
     wtf_settings_init(&conn->local_settings);
     wtf_settings_init(&conn->peer_settings);
@@ -597,7 +598,13 @@ QUIC_STATUS QUIC_API wtf_connection_callback(HQUIC Connection, void* Context,
         }
 
         case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED: {
-            conn->max_datagram_size = Event->DATAGRAM_STATE_CHANGED.MaxSendLength;
+            bool send_enabled = Event->DATAGRAM_STATE_CHANGED.SendEnabled ? true : false;
+            uint32_t max_send_length = send_enabled ? Event->DATAGRAM_STATE_CHANGED.MaxSendLength
+                                                    : 0;
+            atomic_store_explicit(&conn->datagram_send_enabled, send_enabled,
+                                  memory_order_release);
+            atomic_store_explicit(&conn->max_datagram_size, max_send_length,
+                                  memory_order_release);
             WTF_LOG_DEBUG(conn->context, "datagram",
                           "Datagram send state changed: enabled=%d max_send_length=%u",
                           Event->DATAGRAM_STATE_CHANGED.SendEnabled,

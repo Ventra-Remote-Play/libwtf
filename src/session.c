@@ -851,6 +851,11 @@ static wtf_result_t wtf_session_send_datagram_internal(wtf_session* session,
         goto cleanup;
     }
 
+    if (!atomic_load_explicit(&conn->datagram_send_enabled, memory_order_acquire)) {
+        result = WTF_ERROR_PROTOCOL_VIOLATION;
+        goto cleanup;
+    }
+
     uint64_t quarter_stream_id = session->id / 4;
     size_t header_size = wtf_varint_size(quarter_stream_id);
     if (header_size > SIZE_MAX - total_data_size) {
@@ -859,7 +864,9 @@ static wtf_result_t wtf_session_send_datagram_internal(wtf_session* session,
     }
     size_t total_size = header_size + total_data_size;
 
-    if (total_size > conn->max_datagram_size) {
+    uint32_t max_datagram_size = atomic_load_explicit(&conn->max_datagram_size,
+                                                      memory_order_acquire);
+    if (max_datagram_size == 0 || total_size > max_datagram_size) {
         result = WTF_ERROR_BUFFER_TOO_SMALL;
         goto cleanup;
     }
@@ -1145,11 +1152,17 @@ uint32_t wtf_session_get_max_datagram_size(wtf_session_t* session)
     }
 
     size_t header_size = wtf_varint_size(sess->id / 4);
-    if (sess->connection->max_datagram_size <= header_size) {
+    if (!atomic_load_explicit(&sess->connection->datagram_send_enabled, memory_order_acquire)) {
         return 0;
     }
 
-    return (uint32_t)(sess->connection->max_datagram_size - header_size);
+    uint32_t max_datagram_size = atomic_load_explicit(&sess->connection->max_datagram_size,
+                                                      memory_order_acquire);
+    if (max_datagram_size <= header_size) {
+        return 0;
+    }
+
+    return (uint32_t)(max_datagram_size - header_size);
 }
 
 void wtf_session_set_callback(wtf_session_t* session, wtf_session_callback_t callback,

@@ -28,6 +28,8 @@ typedef struct {
     atomic_int server_disconnected;
     atomic_int client_seen_auth_response;
     atomic_int server_seen_auth_header;
+    atomic_uint client_max_datagram_size;
+    atomic_uint server_max_datagram_size;
     atomic_uintptr_t deferred_handle;
 } e2e_state_t;
 
@@ -61,6 +63,8 @@ static void e2e_session_callback(const wtf_session_event_t* event)
     switch (event->type) {
         case WTF_SESSION_EVENT_CONNECTED:
             if (callback_context->endpoint == E2E_ENDPOINT_CLIENT) {
+                atomic_store(&state->client_max_datagram_size,
+                             wtf_session_get_max_datagram_size(event->session));
                 for (size_t i = 0; i < event->connected.header_count; i++) {
                     const wtf_http_header_t* header = &event->connected.headers[i];
                     if (header->name && header->value
@@ -71,6 +75,8 @@ static void e2e_session_callback(const wtf_session_event_t* event)
                 }
                 atomic_fetch_add(&state->client_connected, 1);
             } else {
+                atomic_store(&state->server_max_datagram_size,
+                             wtf_session_get_max_datagram_size(event->session));
                 atomic_fetch_add(&state->server_connected, 1);
             }
             break;
@@ -148,6 +154,21 @@ static int wait_for_counts(e2e_state_t* state, int client_target, int server_tar
             client_target, server_target, atomic_load(&state->client_connected),
             atomic_load(&state->server_connected));
     return 1;
+}
+
+static int validate_session_max_datagram_size(const char* label, wtf_session_t* session)
+{
+    uint32_t max_size = wtf_session_get_max_datagram_size(session);
+    if (max_size == 0) {
+        fprintf(stderr, "e2e: %s max datagram size was unavailable\n", label);
+        return 1;
+    }
+    if (max_size > 65535) {
+        fprintf(stderr, "e2e: %s max datagram size was unexpectedly large: %u\n", label,
+                max_size);
+        return 1;
+    }
+    return 0;
 }
 
 static int make_cert_path(char* buffer, size_t buffer_length, const char* filename)
@@ -240,6 +261,13 @@ static int run_dedicated_pinned_client(wtf_context_t* context, e2e_state_t* stat
         fprintf(stderr, "e2e: client did not observe auth response header\n");
         failure = 1;
     }
+    if (!failure) {
+        failure = validate_session_max_datagram_size("dedicated client", session);
+    }
+    if (!failure && atomic_load(&state->server_max_datagram_size) == 0) {
+        fprintf(stderr, "e2e: server max datagram size was unavailable\n");
+        failure = 1;
+    }
     wtf_session_unref(session);
     wtf_client_disconnect(client, 0, "pinned phase complete");
     wtf_client_destroy(client);
@@ -289,6 +317,20 @@ static int run_pooled_client(wtf_context_t* context, e2e_state_t* state, const c
     }
 
     int failure = wait_for_counts(state, 3, 3);
+    if (!failure) {
+        failure = validate_session_max_datagram_size("first pooled client", first_session);
+    }
+    if (!failure) {
+        failure = validate_session_max_datagram_size("second pooled client", second_session);
+    }
+    if (!failure && atomic_load(&state->client_max_datagram_size) == 0) {
+        fprintf(stderr, "e2e: client max datagram size was unavailable\n");
+        failure = 1;
+    }
+    if (!failure && atomic_load(&state->server_max_datagram_size) == 0) {
+        fprintf(stderr, "e2e: pooled server max datagram size was unavailable\n");
+        failure = 1;
+    }
     wtf_session_unref(first_session);
     wtf_session_unref(second_session);
     wtf_client_disconnect(client, 0, "pooled phase complete");
@@ -312,6 +354,8 @@ int main(void)
     atomic_init(&state.server_disconnected, 0);
     atomic_init(&state.client_seen_auth_response, 0);
     atomic_init(&state.server_seen_auth_header, 0);
+    atomic_init(&state.client_max_datagram_size, 0);
+    atomic_init(&state.server_max_datagram_size, 0);
     atomic_init(&state.deferred_handle, 0);
 
     e2e_callback_context_t server_events = {

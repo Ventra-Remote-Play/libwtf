@@ -383,7 +383,8 @@ typedef struct wtf_connection {
     wtf_server* server;
     wtf_client* client;
     wtf_connection_state_t state;
-    uint32_t max_datagram_size;
+    atomic_bool datagram_send_enabled;
+    atomic_uint max_datagram_size;
 
     wtf_settings local_settings;
     wtf_settings peer_settings;
