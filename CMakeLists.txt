@@ -195,17 +195,14 @@ else()
 
     set(WTF_MSQUIC_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/msquic)
 
+    # Patch the msquic submodule in place. Submodule dirtiness is silenced via
+    # `submodule.msquic.ignore = dirty` in .gitmodules, so the patched working
+    # tree never shows up as a change in this repo or its parents.
     if(WTF_APPLY_BUNDLED_MSQUIC_PATCHES)
         find_package(Git QUIET)
         if(NOT Git_FOUND)
             message(FATAL_ERROR "Git is required to apply bundled MsQuic patches")
         endif()
-
-        set(WTF_MSQUIC_SOURCE_DIR ${CMAKE_CURRENT_BINARY_DIR}/_deps/msquic-patched-src)
-        file(REMOVE_RECURSE ${WTF_MSQUIC_SOURCE_DIR})
-        file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/msquic/
-             DESTINATION ${WTF_MSQUIC_SOURCE_DIR}
-             PATTERN ".git" EXCLUDE)
 
         set(WTF_BUNDLED_MSQUIC_PATCHES
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/msquic/reliable-reset-draft07.patch
@@ -213,14 +210,29 @@ else()
 
         foreach(WTF_BUNDLED_MSQUIC_PATCH IN LISTS WTF_BUNDLED_MSQUIC_PATCHES)
             execute_process(
-                COMMAND ${GIT_EXECUTABLE} apply --check ${WTF_BUNDLED_MSQUIC_PATCH}
+                COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${WTF_BUNDLED_MSQUIC_PATCH}
                 WORKING_DIRECTORY ${WTF_MSQUIC_SOURCE_DIR}
-                RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY
+                RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_ALREADY_APPLIED
                 OUTPUT_QUIET
                 ERROR_QUIET
             )
 
-            if(WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY EQUAL 0)
+            if(WTF_BUNDLED_MSQUIC_PATCH_ALREADY_APPLIED EQUAL 0)
+                message(STATUS "Bundled MsQuic patch already applied: ${WTF_BUNDLED_MSQUIC_PATCH}")
+            else()
+                execute_process(
+                    COMMAND ${GIT_EXECUTABLE} apply --check ${WTF_BUNDLED_MSQUIC_PATCH}
+                    WORKING_DIRECTORY ${WTF_MSQUIC_SOURCE_DIR}
+                    RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY
+                    OUTPUT_QUIET
+                    ERROR_QUIET
+                )
+                if(NOT WTF_BUNDLED_MSQUIC_PATCH_CAN_APPLY EQUAL 0)
+                    message(FATAL_ERROR
+                        "Bundled MsQuic patch no longer applies cleanly: "
+                        "${WTF_BUNDLED_MSQUIC_PATCH}. Update or remove the patch."
+                    )
+                endif()
                 execute_process(
                     COMMAND ${GIT_EXECUTABLE} apply ${WTF_BUNDLED_MSQUIC_PATCH}
                     WORKING_DIRECTORY ${WTF_MSQUIC_SOURCE_DIR}
@@ -230,26 +242,10 @@ else()
                     message(FATAL_ERROR "Failed to apply bundled MsQuic patch: ${WTF_BUNDLED_MSQUIC_PATCH}")
                 endif()
                 message(STATUS "Applied bundled MsQuic patch: ${WTF_BUNDLED_MSQUIC_PATCH}")
-            else()
-                execute_process(
-                    COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${WTF_BUNDLED_MSQUIC_PATCH}
-                    WORKING_DIRECTORY ${WTF_MSQUIC_SOURCE_DIR}
-                    RESULT_VARIABLE WTF_BUNDLED_MSQUIC_PATCH_ALREADY_APPLIED
-                    OUTPUT_QUIET
-                    ERROR_QUIET
-                )
-                if(WTF_BUNDLED_MSQUIC_PATCH_ALREADY_APPLIED EQUAL 0)
-                    message(STATUS "Bundled MsQuic patch already applied: ${WTF_BUNDLED_MSQUIC_PATCH}")
-                else()
-                    message(FATAL_ERROR
-                        "Bundled MsQuic patch no longer applies cleanly: "
-                        "${WTF_BUNDLED_MSQUIC_PATCH}. Update or remove the patch."
-                    )
-                endif()
             endif()
         endforeach()
     endif()
-    
+
     add_subdirectory(${WTF_MSQUIC_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/_deps/msquic-build)
     
     if(TARGET msquic)

@@ -1,6 +1,7 @@
 [submodule "msquic"]
 	path = msquic
 	url = https://github.com/microsoft/msquic
+	ignore = dirty
 [submodule "deps/googletest"]
 	path = deps/googletest
 	url = https://github.com/google/googletest.git

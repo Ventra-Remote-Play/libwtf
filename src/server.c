@@ -389,8 +389,11 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
     settings.IsSet.PeerBidiStreamCount = TRUE;
     settings.PeerUnidiStreamCount = peer_stream_count;
     settings.IsSet.PeerUnidiStreamCount = TRUE;
-    settings.SendBufferingEnabled = FALSE;
-    settings.IsSet.SendBufferingEnabled = FALSE;
+    if (config->send_buffering != WTF_SEND_BUFFERING_DEFAULT) {
+        settings.SendBufferingEnabled =
+            config->send_buffering == WTF_SEND_BUFFERING_ENABLED ? TRUE : FALSE;
+        settings.IsSet.SendBufferingEnabled = TRUE;
+    }
 #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
     settings.ReliableResetEnabled = TRUE;
     settings.IsSet.ReliableResetEnabled = TRUE;

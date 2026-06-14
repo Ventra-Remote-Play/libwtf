@@ -15,9 +15,9 @@ void wtf_settings_init(wtf_settings* settings)
     settings->qpack_max_table_capacity = WTF_QPACK_DYNAMIC_TABLE_SIZE;
     settings->qpack_blocked_streams = WTF_QPACK_MAX_BLOCKED_STREAMS;
     settings->webtransport_max_sessions = WTF_DEFAULT_MAX_SESSIONS;
-    settings->wt_initial_max_data = 0;
-    settings->wt_initial_max_streams_bidi = 0;
-    settings->wt_initial_max_streams_uni = 0;
+    settings->wt_initial_max_data = 1ULL << 60;
+    settings->wt_initial_max_streams_bidi = 1ULL << 60;
+    settings->wt_initial_max_streams_uni = 1ULL << 60;
     settings->h3_datagram_enabled = false;
     settings->h3_datagram_rfc_enabled = false;
     settings->h3_datagram_draft04_enabled = false;
@@ -137,6 +137,19 @@ bool wtf_settings_decode_frame(wtf_connection* conn, const uint8_t* data, size_t
                 WTF_LOG_TRACE(conn->context, "http3",
                               "WebTransport draft-15 enabled: %s",
                               conn->peer_settings.enable_webtransport_draft15 ? "yes" : "no");
+                break;
+
+            case WTF_SETTING_WT_MAX_SESSIONS:
+                conn->peer_settings.enable_webtransport_draft15 = (setting_value != 0);
+                conn->peer_settings.enable_webtransport
+                    = conn->peer_settings.enable_webtransport_draft02
+                    || conn->peer_settings.enable_webtransport_draft07
+                    || conn->peer_settings.enable_webtransport_draft15;
+                conn->peer_settings.webtransport_max_sessions
+                    = setting_value > UINT32_MAX ? UINT32_MAX : (uint32_t)setting_value;
+                WTF_LOG_TRACE(conn->context, "http3",
+                              "Peer WebTransport max sessions: %u",
+                              conn->peer_settings.webtransport_max_sessions);
                 break;
 
             case WTF_SETTING_ENABLE_WEBTRANSPORT_DRAFT02: {
@@ -268,7 +281,7 @@ bool wtf_settings_encode_frame(wtf_connection* conn, uint8_t* buffer, size_t buf
     struct wtf_setting_pair {
         uint64_t id;
         uint64_t value;
-    } settings_list[12];
+    } settings_list[16];
     size_t settings_count = 0;
 
 #define WTF_ADD_SETTING(Id, Value) \
@@ -289,6 +302,8 @@ bool wtf_settings_encode_frame(wtf_connection* conn, uint8_t* buffer, size_t buf
     }
     if (draft15) {
         WTF_ADD_SETTING(WTF_SETTING_WT_ENABLED_DRAFT15, 1);
+        WTF_ADD_SETTING(WTF_SETTING_WT_MAX_SESSIONS,
+                        conn->local_settings.webtransport_max_sessions);
     }
     if (draft02) {
         WTF_ADD_SETTING(WTF_SETTING_ENABLE_WEBTRANSPORT_DRAFT02, 1);

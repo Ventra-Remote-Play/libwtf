@@ -140,6 +140,17 @@ typedef enum {
     WTF_CONGESTION_CONTROL_LOW_LATENCY = 2
 } wtf_congestion_control_t;
 
+//! Stream send-buffering preference.
+//! DEFAULT leaves the transport default in place (msquic buffers sends and
+//! signals completion early). DISABLED makes the transport hold the caller's
+//! buffer until the data is actually transmitted, so send-complete reflects
+//! real flow-control progress and the application can apply backpressure.
+typedef enum {
+    WTF_SEND_BUFFERING_DEFAULT = 0,
+    WTF_SEND_BUFFERING_ENABLED = 1,
+    WTF_SEND_BUFFERING_DISABLED = 2
+} wtf_send_buffering_t;
+
 //! HTTP/3 error codes as defined in RFC 9114
 typedef enum {
     WTF_H3_NO_ERROR = 0x0100,
@@ -461,6 +472,7 @@ typedef struct {
     // Features
     bool enable_0rtt;       //! Enable 0-RTT connections
     bool enable_migration;  //! Enable connection migration
+    wtf_send_buffering_t send_buffering;  //! Stream send-buffering mode; 0 uses transport default
 
     // Callbacks
     wtf_connection_validator_t connection_validator;  //! Connection validation callback
@@ -502,6 +514,7 @@ typedef struct {
 
     bool enable_0rtt;       //! Enable 0-RTT transport use when MsQuic has tickets
     bool enable_migration;  //! Enable connection migration
+    wtf_send_buffering_t send_buffering;  //! Stream send-buffering mode; 0 uses transport default
 
     wtf_session_callback_t session_callback;  //! Session event callback
     void* user_context;                       //! User context for callbacks

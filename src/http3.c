@@ -713,13 +713,6 @@ static bool wtf_http3_validate_settings(wtf_connection* conn)
 
     switch (conn->selected_webtransport_draft) {
         case WTF_WEBTRANSPORT_DRAFT_15: {
-#ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
-            if (conn->reliable_reset_negotiation_complete && !conn->reliable_reset_negotiated) {
-                WTF_LOG_TRACE(conn->context, "settings",
-                              "Reliable reset not negotiated for draft-15 peer");
-                return false;
-            }
-#endif
             if (conn->role == WTF_ENDPOINT_CLIENT && !conn->peer_settings.enable_connect_protocol) {
                 WTF_LOG_TRACE(conn->context, "settings",
                               "CONNECT protocol not enabled by draft-15 peer");
