@@ -161,6 +161,7 @@ endif()
 if(WTF_USE_EXTERNAL_MSQUIC)
     find_package(msquic CONFIG REQUIRED)
     set(MSQUIC_LIBRARIES msquic)
+    set(WTF_EXTERNAL_MSQUIC ON)
 else()
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
     
@@ -374,6 +375,10 @@ target_link_libraries(wtf
         ${PLATFORM_LIBS}
 )
 
+if(MSVC)
+    target_compile_options(wtf PRIVATE /experimental:c11atomics)
+endif()
+
 if(WTF_ENABLE_COVERAGE)
     target_compile_options(wtf PRIVATE ${WTF_COVERAGE_COMPILE_OPTIONS})
     target_link_options(wtf PRIVATE ${WTF_COVERAGE_LINK_OPTIONS})
@@ -383,7 +388,11 @@ if(WTF_ENABLE_LOGGING)
     target_compile_definitions(wtf PRIVATE WTF_ENABLE_LOGGING=1)
 endif()
 
-target_compile_definitions(wtf PRIVATE WTF_EXPORTS)
+target_compile_definitions(wtf PRIVATE WTF_EXPORTS QUIC_API_ENABLE_PREVIEW_FEATURES=1)
+
+if(WTF_EXTERNAL_MSQUIC)
+    target_compile_definitions(wtf PRIVATE WTF_EXTERNAL_MSQUIC=1)
+endif()
 
 if(NOT WIN32)
     target_compile_options(wtf PRIVATE -fvisibility=hidden)

@@ -5,6 +5,67 @@
 #include "utils.h"
 #include "wtf.h"
 
+#define WTF_MAX_WORKER_PROCESSORS 256u
+
+#ifdef WTF_EXTERNAL_MSQUIC
+typedef QUIC_EXECUTION_CONFIG wtf_quic_execution_config_t;
+#define WTF_QUIC_EXECUTION_CONFIG_FLAGS_NONE QUIC_EXECUTION_CONFIG_FLAG_NONE
+#define WTF_QUIC_EXECUTION_CONFIG_MIN_SIZE QUIC_EXECUTION_CONFIG_MIN_SIZE
+#else
+typedef QUIC_GLOBAL_EXECUTION_CONFIG wtf_quic_execution_config_t;
+#define WTF_QUIC_EXECUTION_CONFIG_FLAGS_NONE QUIC_GLOBAL_EXECUTION_CONFIG_FLAG_NONE
+#define WTF_QUIC_EXECUTION_CONFIG_MIN_SIZE QUIC_GLOBAL_EXECUTION_CONFIG_MIN_SIZE
+#endif
+
+#define WTF_EXECUTION_CONFIG_STORAGE_SIZE \
+    (WTF_QUIC_EXECUTION_CONFIG_MIN_SIZE + WTF_MAX_WORKER_PROCESSORS * sizeof(uint16_t))
+
+// QUIC_PARAM_GLOBAL_EXECUTION_CONFIG is process-global. MsQuic keeps using the
+// supplied processor list after SetParam returns, so the backing storage must
+// live for the lifetime of the MsQuic library, not merely for context creation.
+static uint64_t wtf_execution_config_storage[
+    (WTF_EXECUTION_CONFIG_STORAGE_SIZE + sizeof(uint64_t) - 1) / sizeof(uint64_t)];
+
+static QUIC_STATUS wtf_apply_execution_config(const QUIC_API_TABLE* quic_api,
+                                              const wtf_context_config_t* config)
+{
+    if (config->worker_thread_count == 0) {
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    uint32_t processor_count = config->enable_load_balancing
+                                   ? config->worker_thread_count
+                                   : 1u;
+    if (processor_count > WTF_MAX_WORKER_PROCESSORS) {
+        processor_count = WTF_MAX_WORKER_PROCESSORS;
+    }
+    uint32_t processor_offset = config->worker_processor_offset;
+    if (processor_offset >= WTF_MAX_WORKER_PROCESSORS) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+    if (processor_count > WTF_MAX_WORKER_PROCESSORS - processor_offset) {
+        processor_count = WTF_MAX_WORKER_PROCESSORS - processor_offset;
+    }
+
+    uint32_t config_size = WTF_QUIC_EXECUTION_CONFIG_MIN_SIZE +
+                           processor_count * sizeof(uint16_t);
+    memset(wtf_execution_config_storage, 0, WTF_EXECUTION_CONFIG_STORAGE_SIZE);
+    wtf_quic_execution_config_t* execution_config =
+        (wtf_quic_execution_config_t*)wtf_execution_config_storage;
+    execution_config->Flags = WTF_QUIC_EXECUTION_CONFIG_FLAGS_NONE;
+    execution_config->PollingIdleTimeoutUs = 0;
+    execution_config->ProcessorCount = processor_count;
+    for (uint32_t i = 0; i < processor_count; ++i) {
+        execution_config->ProcessorList[i] = (uint16_t)(processor_offset + i);
+    }
+
+    return quic_api->SetParam(
+        NULL,
+        QUIC_PARAM_GLOBAL_EXECUTION_CONFIG,
+        config_size,
+        execution_config);
+}
+
 wtf_result_t wtf_context_create(const wtf_context_config_t* config, wtf_context_t** context)
 {
     if (!config || !context) {
@@ -30,6 +91,15 @@ wtf_result_t wtf_context_create(const wtf_context_config_t* config, wtf_context_
     QUIC_STATUS status = MsQuicOpen2(&ctx->quic_api);
     if (QUIC_FAILED(status)) {
         WTF_LOG_CRITICAL(ctx, "context", "MsQuicOpen2 failed: 0x%x", status);
+        mtx_destroy(&ctx->mutex);
+        free(ctx);
+        return wtf_quic_status_to_result(status);
+    }
+
+    status = wtf_apply_execution_config(ctx->quic_api, config);
+    if (QUIC_FAILED(status)) {
+        WTF_LOG_CRITICAL(ctx, "context", "MsQuic execution configuration failed: 0x%x", status);
+        MsQuicClose(ctx->quic_api);
         mtx_destroy(&ctx->mutex);
         free(ctx);
         return wtf_quic_status_to_result(status);

@@ -525,10 +525,11 @@ typedef struct {
     wtf_log_level_t log_level;                  //! Global logging level
     wtf_log_callback_t log_callback;            //! Custom logging callback
     void* log_user_context;                     //! Context for log callback
-    uint32_t worker_thread_count;               //! Number of worker threads
-    bool enable_load_balancing;                 //! Enable load balancing
+    uint32_t worker_thread_count;               //! MsQuic worker processors; 0 uses its default
+    bool enable_load_balancing;                 //! Use all configured workers; false uses one
     bool disable_encryption;                    //! Disable encryption for testing
     wtf_execution_profile_t execution_profile;  //! Performance profile
+    uint32_t worker_processor_offset;           //! First logical processor for MsQuic workers
 } wtf_context_config_t;
 
 //! Library version information
