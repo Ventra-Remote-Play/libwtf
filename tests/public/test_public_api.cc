@@ -1,8 +1,7 @@
-#include <gtest/gtest.h>
-
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <gtest/gtest.h>
 #include <limits>
 
 extern "C" {
@@ -44,6 +43,11 @@ void free_response_headers(wtf_connection_response_t* response)
     }
     free(response->headers);
     *response = {};
+}
+
+void test_http_route_handler(const wtf_http_request_t*, wtf_http_response_t* response, void*)
+{
+    response->status_code = 204;
 }
 
 }  // namespace
@@ -144,8 +148,7 @@ TEST_F(ContextFixture, ClientCreateValidationAndLifecycle)
 
     wtf_client_config_t bad_cert_options = config;
     bad_cert_options.ca_cert_file = kServerCertPath;
-    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
-              wtf_client_create(context_, &bad_cert_options, &client));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_client_create(context_, &bad_cert_options, &client));
 
     ASSERT_EQ(WTF_SUCCESS, wtf_client_create(context_, &config, &client));
     ASSERT_NE(nullptr, client);
@@ -191,6 +194,27 @@ TEST_F(ContextFixture, ServerCreateValidationAndLifecycle)
     ASSERT_EQ(WTF_SUCCESS, wtf_server_create(context_, &config, &server));
     ASSERT_NE(nullptr, server);
     EXPECT_EQ(WTF_SERVER_STOPPED, wtf_server_get_state(server));
+    EXPECT_EQ(
+        WTF_ERROR_INVALID_PARAMETER,
+        wtf_server_add_http_route(nullptr, "GET", "/health", test_http_route_handler, nullptr));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
+              wtf_server_add_http_route(server, "", "/health", test_http_route_handler, nullptr));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
+              wtf_server_add_http_route(server, "GET", "health", test_http_route_handler, nullptr));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
+              wtf_server_add_http_route(server, "GET", "/health?full=1", test_http_route_handler,
+                                        nullptr));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
+              wtf_server_add_http_route(server, "GET", "/health", nullptr, nullptr));
+    EXPECT_EQ(
+        WTF_SUCCESS,
+        wtf_server_add_http_route(server, "GET", "/health", test_http_route_handler, nullptr));
+    EXPECT_EQ(
+        WTF_ERROR_INVALID_STATE,
+        wtf_server_add_http_route(server, "GET", "/health", test_http_route_handler, nullptr));
+    EXPECT_EQ(
+        WTF_SUCCESS,
+        wtf_server_add_http_route(server, "POST", "/health", test_http_route_handler, nullptr));
 
     wtf_server_t* second_server = nullptr;
     EXPECT_EQ(WTF_ERROR_INVALID_STATE, wtf_server_create(context_, &config, &second_server));
@@ -200,6 +224,9 @@ TEST_F(ContextFixture, ServerCreateValidationAndLifecycle)
     EXPECT_EQ(WTF_SUCCESS, start_result);
     if (start_result == WTF_SUCCESS) {
         EXPECT_EQ(WTF_SERVER_LISTENING, wtf_server_get_state(server));
+        EXPECT_EQ(
+            WTF_ERROR_INVALID_STATE,
+            wtf_server_add_http_route(server, "GET", "/late", test_http_route_handler, nullptr));
         EXPECT_EQ(WTF_ERROR_INVALID_STATE, wtf_server_start(server));
         EXPECT_EQ(WTF_SUCCESS, wtf_server_stop(server));
         EXPECT_EQ(WTF_SERVER_STOPPED, wtf_server_get_state(server));
@@ -240,14 +267,11 @@ TEST(PublicApiSurface, SessionNullContracts)
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_session_close(nullptr, 0, nullptr));
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_session_drain(nullptr));
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_session_send_datagram(nullptr, nullptr, 0, nullptr));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_session_send_datagram_copy(nullptr, "data", 4));
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
-              wtf_session_send_datagram_copy(nullptr, "data", 4));
-    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_session_create_stream(nullptr,
-                                                                     WTF_STREAM_BIDIRECTIONAL,
-                                                                     nullptr));
+              wtf_session_create_stream(nullptr, WTF_STREAM_BIDIRECTIONAL, nullptr));
     EXPECT_EQ(WTF_SESSION_CLOSED, wtf_session_get_state(nullptr));
-    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
-              wtf_session_get_peer_address(nullptr, nullptr, nullptr));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_session_get_peer_address(nullptr, nullptr, nullptr));
     EXPECT_EQ(0u, wtf_session_get_max_datagram_size(nullptr));
     EXPECT_EQ(nullptr, wtf_session_find_stream_by_id(nullptr, 1));
     EXPECT_EQ(nullptr, wtf_session_get_context(nullptr));
@@ -267,8 +291,8 @@ TEST(PublicApiSurface, StreamNullContracts)
     uint64_t stream_id = 0;
 
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_stream_send(nullptr, &buffer, 1, false, nullptr));
-    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_stream_send_copy(nullptr, payload,
-                                                               sizeof(payload), false));
+    EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER,
+              wtf_stream_send_copy(nullptr, payload, sizeof(payload), false));
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_stream_close(nullptr));
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_stream_abort(nullptr, 0));
     EXPECT_EQ(WTF_ERROR_INVALID_PARAMETER, wtf_stream_get_id(nullptr, &stream_id));

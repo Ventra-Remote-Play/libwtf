@@ -178,6 +178,25 @@ static void wtf_cleanup_server_cred_config(wtf_server* srv)
     srv->cred_config = NULL;
 }
 
+static void wtf_cleanup_http_routes(wtf_server* server)
+{
+    if (!server) {
+        return;
+    }
+
+    wtf_http_route* route = server->http_routes;
+    while (route) {
+        wtf_http_route* next = route->next;
+        free(route->method);
+        free(route->path);
+        free(route);
+        route = next;
+    }
+    server->http_routes = NULL;
+    server->http_routes_tail = NULL;
+    server->http_route_count = 0;
+}
+
 static void wtf_cleanup_server_config(wtf_server* srv)
 {
     if (!srv) {
@@ -310,6 +329,56 @@ wtf_server_state_t wtf_server_get_state(wtf_server_t* server)
     return state;
 }
 
+wtf_result_t wtf_server_add_http_route(wtf_server_t* server, const char* method, const char* path,
+                                       wtf_http_route_handler_t handler, void* user_context)
+{
+    if (!server || !method || method[0] == '\0' || !path || path[0] != '/'
+        || strchr(path, '?') || strchr(path, '#') || !handler) {
+        return WTF_ERROR_INVALID_PARAMETER;
+    }
+
+    wtf_server* srv = server;
+    mtx_lock(&srv->mutex);
+    if (srv->state != WTF_SERVER_STOPPED) {
+        mtx_unlock(&srv->mutex);
+        return WTF_ERROR_INVALID_STATE;
+    }
+
+    for (wtf_http_route* existing = srv->http_routes; existing; existing = existing->next) {
+        if (strcmp(existing->method, method) == 0 && strcmp(existing->path, path) == 0) {
+            mtx_unlock(&srv->mutex);
+            return WTF_ERROR_INVALID_STATE;
+        }
+    }
+
+    wtf_http_route* route = calloc(1, sizeof(*route));
+    if (!route) {
+        mtx_unlock(&srv->mutex);
+        return WTF_ERROR_OUT_OF_MEMORY;
+    }
+    route->method = wtf_strdup(method);
+    route->path = wtf_strdup(path);
+    route->handler = handler;
+    route->user_context = user_context;
+    if (!route->method || !route->path) {
+        free(route->method);
+        free(route->path);
+        free(route);
+        mtx_unlock(&srv->mutex);
+        return WTF_ERROR_OUT_OF_MEMORY;
+    }
+
+    if (srv->http_routes_tail) {
+        srv->http_routes_tail->next = route;
+    } else {
+        srv->http_routes = route;
+    }
+    srv->http_routes_tail = route;
+    srv->http_route_count++;
+    mtx_unlock(&srv->mutex);
+    return WTF_SUCCESS;
+}
+
 wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t* config,
                                wtf_server_t** server)
 {
@@ -390,8 +459,9 @@ wtf_result_t wtf_server_create(wtf_context_t* context, const wtf_server_config_t
     settings.PeerUnidiStreamCount = peer_stream_count;
     settings.IsSet.PeerUnidiStreamCount = TRUE;
     if (config->send_buffering != WTF_SEND_BUFFERING_DEFAULT) {
-        settings.SendBufferingEnabled =
-            config->send_buffering == WTF_SEND_BUFFERING_ENABLED ? TRUE : FALSE;
+        settings.SendBufferingEnabled = config->send_buffering == WTF_SEND_BUFFERING_ENABLED
+            ? TRUE
+            : FALSE;
         settings.IsSet.SendBufferingEnabled = TRUE;
     }
 #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
@@ -717,7 +787,8 @@ void wtf_server_destroy(wtf_server_t* server)
             wtf_connection* conn = connections[i];
             HQUIC connection = conn->quic_connection;
             if (connection && ctx && ctx->quic_api) {
-                ctx->quic_api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+                ctx->quic_api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,
+                                                  0);
                 ctx->quic_api->ConnectionClose(connection);
                 conn->quic_connection = NULL;
             }
@@ -753,6 +824,7 @@ void wtf_server_destroy(wtf_server_t* server)
 
     wtf_cleanup_server_cred_config(srv);
     wtf_cleanup_server_config(srv);
+    wtf_cleanup_http_routes(srv);
 
     if (ctx) {
         mtx_lock(&ctx->mutex);

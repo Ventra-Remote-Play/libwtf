@@ -8,6 +8,7 @@ _wtf_server_create
 _wtf_server_start
 _wtf_server_stop
 _wtf_server_get_state
+_wtf_server_add_http_route
 _wtf_connection_response_add_header
 _wtf_connection_request_ref
 _wtf_connection_request_unref

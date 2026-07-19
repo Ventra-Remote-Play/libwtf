@@ -10,6 +10,7 @@ EXPORTS
     wtf_server_start
     wtf_server_stop
     wtf_server_get_state
+    wtf_server_add_http_route
     wtf_connection_response_add_header
     wtf_connection_request_ref
     wtf_connection_request_unref

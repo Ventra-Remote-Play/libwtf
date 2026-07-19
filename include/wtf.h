@@ -264,6 +264,30 @@ typedef struct {
     const char* value;  //! Header value
 } wtf_http_header_t;
 
+//! Buffered HTTP/3 request passed to a registered route handler.
+//! All pointers are borrowed and remain valid only for the duration of the callback.
+typedef struct {
+    const char* method;
+    const char* path;
+    const char* authority;
+    const wtf_http_header_t* headers;
+    size_t header_count;
+    const uint8_t* body;
+    size_t body_length;
+    const void* peer_address;
+    size_t address_length;
+} wtf_http_request_t;
+
+//! HTTP/3 response filled by a route handler.
+//! Header, descriptor, and body memory only needs to remain valid until the callback returns.
+typedef struct {
+    uint16_t status_code;              //! 200-599; defaults to 200 when zero
+    const wtf_http_header_t* headers;  //! Optional non-pseudo response headers
+    size_t header_count;
+    const wtf_buffer_t* body_buffers;  //! Optional scatter-gather response body
+    uint32_t body_buffer_count;
+} wtf_http_response_t;
+
 //! Mutable CONNECT response metadata for connection validation callbacks.
 //! Initialize and free only through libwtf; add custom headers with
 //! wtf_connection_response_add_header().
@@ -275,13 +299,13 @@ typedef struct {
 
 //! Connection request information for validation
 typedef struct {
-    const char* origin;                //! Origin of the request; valid only during callback
-    const char* path;                  //! Request path; valid only during callback
-    const char* authority;             //! Authority header value; valid only during callback
-    const wtf_http_header_t* headers;  //! Array of HTTP headers; valid only during callback
-    size_t header_count;               //! Number of headers
-    void* peer_address;                //! Peer network address; valid only during callback
-    size_t address_length;             //! Size of address structure
+    const char* origin;                       //! Origin of the request; valid only during callback
+    const char* path;                         //! Request path; valid only during callback
+    const char* authority;                    //! Authority header value; valid only during callback
+    const wtf_http_header_t* headers;         //! Array of HTTP headers; valid only during callback
+    size_t header_count;                      //! Number of headers
+    void* peer_address;                       //! Peer network address; valid only during callback
+    size_t address_length;                    //! Size of address structure
     wtf_connection_request_handle_t* handle;  //! Complete this handle if returning DEFER
 } wtf_connection_request_t;
 
@@ -294,7 +318,8 @@ typedef struct {
     union {
         struct {
             uint16_t status_code;              //! CONNECT response status, or 0 when unavailable
-            const wtf_http_header_t* headers;  //! CONNECT response headers; valid only during callback
+            const wtf_http_header_t* headers;  //! CONNECT response headers; valid only during
+                                               //! callback
             size_t header_count;               //! Number of CONNECT response headers
         } connected;
 
@@ -302,12 +327,13 @@ typedef struct {
             uint32_t error_code;               //! Error code for disconnection
             const char* reason;                //! Human-readable reason
             uint16_t status_code;              //! CONNECT response status, or 0 when unavailable
-            const wtf_http_header_t* headers;  //! CONNECT response headers; valid only during callback
+            const wtf_http_header_t* headers;  //! CONNECT response headers; valid only during
+                                               //! callback
             size_t header_count;               //! Number of CONNECT response headers
         } disconnected;
 
         struct {
-            wtf_stream_t* stream;           //! Borrowed; call wtf_stream_ref() to keep after callback
+            wtf_stream_t* stream;  //! Borrowed; call wtf_stream_ref() to keep after callback
             wtf_stream_type_t stream_type;  //! Type of the new stream
         } stream_opened;
 
@@ -319,7 +345,7 @@ typedef struct {
         } datagram_send_state_changed;
 
         struct {
-            uint32_t length;     //! Size of data in bytes
+            uint32_t length;      //! Size of data in bytes
             const uint8_t* data;  //! Valid only until the session callback returns
         } datagram_received;
     };
@@ -371,6 +397,11 @@ typedef struct {
 typedef wtf_connection_decision_t (*wtf_connection_validator_t)(
     const wtf_connection_request_t* request, wtf_connection_response_t* response,
     void* user_context);
+
+//! Handler for an exact-match HTTP/3 method/path route.
+//! The complete request body is buffered up to 1 MiB before this callback runs.
+typedef void (*wtf_http_route_handler_t)(const wtf_http_request_t* request,
+                                         wtf_http_response_t* response, void* user_context);
 
 //! Session event notification callback
 //! Callbacks run on MsQuic worker threads and may run concurrently for different objects.
@@ -463,15 +494,15 @@ typedef struct {
     uint32_t max_streams_per_session;      //! Maximum streams per session
     uint64_t max_data_per_session;         //! Maximum data per session
     uint32_t stream_recv_window;           //! QUIC stream receive window; 0 uses library default
-    uint32_t conn_flow_control_window;     //! QUIC connection receive window; 0 uses library default
+    uint32_t conn_flow_control_window;  //! QUIC connection receive window; 0 uses library default
 
     // Timeouts
     uint32_t idle_timeout_ms;       //! Idle timeout in milliseconds
     uint32_t handshake_timeout_ms;  //! Handshake timeout in milliseconds
 
     // Features
-    bool enable_0rtt;       //! Enable 0-RTT connections
-    bool enable_migration;  //! Enable connection migration
+    bool enable_0rtt;                     //! Enable 0-RTT connections
+    bool enable_migration;                //! Enable connection migration
     wtf_send_buffering_t send_buffering;  //! Stream send-buffering mode; 0 uses transport default
 
     // Callbacks
@@ -490,9 +521,9 @@ typedef struct {
 
     wtf_webtransport_draft_t draft;  //! Draft to use, or AUTO to select newest peer-supported draft
 
-    bool allow_pooling;                         //! Allow multiple sessions on the same QUIC connection
-    wtf_congestion_control_t congestion_control; //! Congestion-control preference hint
-    bool require_unreliable;                    //! Require HTTP/3 datagram support; always true for libwtf H3
+    bool allow_pooling;              //! Allow multiple sessions on the same QUIC connection
+    wtf_congestion_control_t congestion_control;  //! Congestion-control preference hint
+    bool require_unreliable;  //! Require HTTP/3 datagram support; always true for libwtf H3
 
     bool skip_certificate_validation;  //! Disable server certificate validation for local testing
     //! Optional CA file for MsQuic/OpenSSL TLS backends; copied at create time.
@@ -503,17 +534,17 @@ typedef struct {
     //! must match the canonical DER certificate from the file.
     const char* pinned_server_certificate_file;
 
-    uint32_t max_sessions_per_connection; //! Pool capacity when allow_pooling is true
-    uint32_t max_streams_per_session;   //! Maximum streams for the opened session
-    uint64_t max_data_per_session;      //! Maximum data per session
-    uint32_t stream_recv_window;        //! QUIC stream receive window; 0 uses library default
-    uint32_t conn_flow_control_window;  //! QUIC connection receive window; 0 uses library default
+    uint32_t max_sessions_per_connection;  //! Pool capacity when allow_pooling is true
+    uint32_t max_streams_per_session;      //! Maximum streams for the opened session
+    uint64_t max_data_per_session;         //! Maximum data per session
+    uint32_t stream_recv_window;           //! QUIC stream receive window; 0 uses library default
+    uint32_t conn_flow_control_window;    //! QUIC connection receive window; 0 uses library default
 
-    uint32_t idle_timeout_ms;       //! Idle timeout in milliseconds
-    uint32_t handshake_timeout_ms;  //! Handshake/session setup timeout in milliseconds
+    uint32_t idle_timeout_ms;             //! Idle timeout in milliseconds
+    uint32_t handshake_timeout_ms;        //! Handshake/session setup timeout in milliseconds
 
-    bool enable_0rtt;       //! Enable 0-RTT transport use when MsQuic has tickets
-    bool enable_migration;  //! Enable connection migration
+    bool enable_0rtt;                     //! Enable 0-RTT transport use when MsQuic has tickets
+    bool enable_migration;                //! Enable connection migration
     wtf_send_buffering_t send_buffering;  //! Stream send-buffering mode; 0 uses transport default
 
     wtf_session_callback_t session_callback;  //! Session event callback
@@ -587,6 +618,12 @@ WTF_API wtf_result_t wtf_server_stop(wtf_server_t* server);
 //! @param server target server instance
 //! @return current operational state
 WTF_API wtf_server_state_t wtf_server_get_state(wtf_server_t* server);
+
+//! Register an exact-match HTTP/3 route. Must be called before wtf_server_start().
+//! Method matching is case-sensitive; path matching excludes the query string.
+WTF_API wtf_result_t wtf_server_add_http_route(wtf_server_t* server, const char* method,
+                                               const char* path, wtf_http_route_handler_t handler,
+                                               void* user_context);
 
 //! Add a non-pseudo HTTP response header while handling a connection validation callback.
 //! The name and value are copied. Header names beginning with ':' are rejected.
@@ -765,7 +802,7 @@ WTF_API void wtf_session_set_context(wtf_session_t* session, void* user_context)
 
 //! Get session user context
 //! @param session target session
-//! @return user-provided context data  
+//! @return user-provided context data
 WTF_API void* wtf_session_get_context(wtf_session_t* session);
 
 // #endregion
@@ -843,7 +880,7 @@ WTF_API void wtf_stream_set_context(wtf_stream_t* stream, void* user_context);
 //! Get stream user context
 //! @param stream target stream
 //! @return user-provided context data
-WTF_API void* wtf_stream_get_context(wtf_stream_t* stream); 
+WTF_API void* wtf_stream_get_context(wtf_stream_t* stream);
 
 //! Get stream type
 //! @param stream target stream

@@ -30,8 +30,10 @@
 
 #if defined(__GNUC__) || defined(__clang__)
     #define ECHO_MAYBE_UNUSED __attribute__((unused))
+    #define ECHO_THREAD_LOCAL _Thread_local
 #else
     #define ECHO_MAYBE_UNUSED
+    #define ECHO_THREAD_LOCAL __declspec(thread)
 #endif
 
 static volatile bool g_running = true;
@@ -39,6 +41,39 @@ static wtf_server_t* g_server = NULL;
 static wtf_context_t* g_context = NULL;
 void stream_callback(const wtf_stream_event_t* event);
 void session_callback(const wtf_session_event_t* event);
+
+static void health_route(const wtf_http_request_t* request, wtf_http_response_t* response,
+                         void* user_context)
+{
+    (void)request;
+    (void)user_context;
+    static const wtf_http_header_t headers[] = {{"content-type", "text/plain"}};
+    static const uint8_t body_part_1[] = "libwtf ";
+    static const uint8_t body_part_2[] = "ok\n";
+    static const wtf_buffer_t body[] = {
+        {sizeof(body_part_1) - 1, body_part_1},
+        {sizeof(body_part_2) - 1, body_part_2},
+    };
+    response->status_code = 200;
+    response->headers = headers;
+    response->header_count = sizeof(headers) / sizeof(headers[0]);
+    response->body_buffers = body;
+    response->body_buffer_count = sizeof(body) / sizeof(body[0]);
+}
+
+static void echo_http_route(const wtf_http_request_t* request, wtf_http_response_t* response,
+                            void* user_context)
+{
+    (void)user_context;
+    static const wtf_http_header_t headers[] = {{"content-type", "application/octet-stream"}};
+    static ECHO_THREAD_LOCAL wtf_buffer_t body;
+    body = (wtf_buffer_t) {(uint32_t)request->body_length, request->body};
+    response->status_code = 200;
+    response->headers = headers;
+    response->header_count = sizeof(headers) / sizeof(headers[0]);
+    response->body_buffers = request->body_length ? &body : NULL;
+    response->body_buffer_count = request->body_length ? 1 : 0;
+}
 
 typedef struct {
     uint64_t sessions_created;
@@ -234,7 +269,7 @@ wtf_result_t handle_request_stream(wtf_session_t* session, const char* stream_ty
 wtf_result_t handle_ping(wtf_session_t* session, const char* ping_data)
 {
     uint64_t timestamp = get_timestamp_ms();
-    
+
     int msg_len = snprintf(NULL, 0, "PONG_%s_server_time=%" PRIu64, ping_data, timestamp);
     if (msg_len <= 0) {
         return WTF_ERROR_INVALID_PARAMETER;
@@ -244,17 +279,17 @@ wtf_result_t handle_ping(wtf_session_t* session, const char* ping_data)
     if (!pong_response) {
         return WTF_ERROR_OUT_OF_MEMORY;
     }
-    
-    int actual_len = snprintf(pong_response, msg_len + 1, "PONG_%s_server_time=%" PRIu64,
-                             ping_data, timestamp);
-    
+
+    int actual_len = snprintf(pong_response, msg_len + 1, "PONG_%s_server_time=%" PRIu64, ping_data,
+                              timestamp);
+
     if (actual_len != msg_len) {
         free(pong_response);
         return WTF_ERROR_INVALID_PARAMETER;
     }
-    
+
     wtf_result_t result = wtf_session_send_datagram_copy(session, pong_response, (size_t)msg_len);
-    
+
     if (result == WTF_SUCCESS) {
         g_stats.datagrams_sent++;
         g_stats.bytes_sent += (uint32_t)msg_len;
@@ -276,7 +311,7 @@ wtf_result_t handle_stats_request(wtf_session_t* session)
         g_stats.streams_created - g_stats.streams_destroyed, g_stats.streams_created,
         g_stats.server_streams_created, g_stats.datagrams_received, g_stats.datagrams_sent,
         g_stats.bytes_received, g_stats.bytes_sent);
-    
+
     if (msg_len <= 0) {
         return WTF_ERROR_INVALID_PARAMETER;
     }
@@ -285,7 +320,7 @@ wtf_result_t handle_stats_request(wtf_session_t* session)
     if (!stats_response) {
         return WTF_ERROR_OUT_OF_MEMORY;
     }
-    
+
     int actual_len = snprintf(
         stats_response, msg_len + 1,
         "STATS:sessions=%" PRIu64 "/%" PRIu64 ",streams=%" PRIu64 "/%" PRIu64
@@ -296,22 +331,21 @@ wtf_result_t handle_stats_request(wtf_session_t* session)
         g_stats.streams_created - g_stats.streams_destroyed, g_stats.streams_created,
         g_stats.server_streams_created, g_stats.datagrams_received, g_stats.datagrams_sent,
         g_stats.bytes_received, g_stats.bytes_sent);
-    
+
     if (actual_len != msg_len) {
         free(stats_response);
         return WTF_ERROR_INVALID_PARAMETER;
     }
-    
-    wtf_result_t result = wtf_session_send_datagram_copy(session, stats_response,
-                                                        (size_t)msg_len);
-    
+
+    wtf_result_t result = wtf_session_send_datagram_copy(session, stats_response, (size_t)msg_len);
+
     if (result == WTF_SUCCESS) {
         g_stats.datagrams_sent++;
         g_stats.bytes_sent += (uint32_t)msg_len;
         printf("[CMD] Stats sent to client\n");
     }
     free(stats_response);
-    
+
     return result;
 }
 
@@ -363,8 +397,7 @@ wtf_connection_decision_t connection_validator(const wtf_connection_request_t* r
     wtf_result_t header_result = wtf_connection_response_add_header(
         response, "x-libwtf-echo", "accepted");
     if (header_result != WTF_SUCCESS) {
-        printf("[CONN] Failed to add response header: %s\n",
-               wtf_result_to_string(header_result));
+        printf("[CONN] Failed to add response header: %s\n", wtf_result_to_string(header_result));
     }
 
     return WTF_CONNECTION_ACCEPT;
@@ -436,8 +469,7 @@ void stream_callback(const wtf_stream_event_t* event)
                         g_stats.bytes_sent += total_length;
                         printf("[STREAM] Echoed %zu bytes back\n", total_length);
                     } else {
-                        printf("[STREAM] Failed to echo data: %s\n",
-                               wtf_result_to_string(result));
+                        printf("[STREAM] Failed to echo data: %s\n", wtf_result_to_string(result));
                     }
                 }
             }
@@ -607,8 +639,8 @@ void session_callback(const wtf_session_event_t* event)
                                 reversed[len - i - 1] = temp;
                             }
 
-                            wtf_result_t result = wtf_session_send_datagram_copy(
-                                event->session, reversed, len);
+                            wtf_result_t result = wtf_session_send_datagram_copy(event->session,
+                                                                                 reversed, len);
                             if (result == WTF_SUCCESS) {
                                 g_stats.datagrams_sent++;
                                 g_stats.bytes_sent += len;
@@ -802,6 +834,17 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    status = wtf_server_add_http_route(g_server, "GET", "/health", health_route, NULL);
+    if (status == WTF_SUCCESS) {
+        status = wtf_server_add_http_route(g_server, "POST", "/echo", echo_http_route, NULL);
+    }
+    if (status != WTF_SUCCESS) {
+        printf("[ERROR] Failed to register HTTP/3 routes: %s\n", wtf_result_to_string(status));
+        wtf_server_destroy(g_server);
+        wtf_context_destroy(g_context);
+        return 1;
+    }
+
     status = wtf_server_start(g_server);
     if (status != WTF_SUCCESS) {
         printf("[ERROR] Failed to start server: %s\n", wtf_result_to_string(status));
@@ -811,6 +854,7 @@ int main(int argc, char* argv[])
     }
 
     printf("[SERVER] WebTransport server listening on port %u\n", port);
+    printf("[SERVER] HTTP/3 routes: GET /health, POST /echo\n");
     printf("[SERVER] Ready to accept connections...\n");
     printf("[SERVER] Press Ctrl+C to stop\n\n");
 

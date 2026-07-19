@@ -20,8 +20,7 @@ static struct lsxpack_header* wtf_qpack_prepare_decode(void* context, struct lsx
 
     if (space > sizeof(ctx->decode_buffer)) {
         if (ctx->connection && ctx->connection->context) {
-            WTF_LOG_ERROR(ctx->connection->context, "qpack", "Header too large: %zu bytes",
-                          space);
+            WTF_LOG_ERROR(ctx->connection->context, "qpack", "Header too large: %zu bytes", space);
         }
         return NULL;
     }
@@ -89,9 +88,8 @@ static bool update_pseudo_field(wtf_header_decode_context* ctx, char** field, bo
     return update_request_field(field, value, value_len);
 }
 
-static bool process_pseudo_header(wtf_header_decode_context* ctx, const char* name,
-                                  size_t name_len, const char* value, size_t value_len,
-                                  wtf_context* log_ctx)
+static bool process_pseudo_header(wtf_header_decode_context* ctx, const char* name, size_t name_len,
+                                  const char* value, size_t value_len, wtf_context* log_ctx)
 {
     wtf_connect_request* request = ctx->request;
 
@@ -105,11 +103,11 @@ static bool process_pseudo_header(wtf_header_decode_context* ctx, const char* na
         return update_pseudo_field(ctx, &request->authority, &ctx->seen_authority, ":authority",
                                    value, value_len, log_ctx);
     } else if (name_len == 5 && strncmp(name, ":path", 5) == 0) {
-        return update_pseudo_field(ctx, &request->path, &ctx->seen_path, ":path", value,
-                                   value_len, log_ctx);
+        return update_pseudo_field(ctx, &request->path, &ctx->seen_path, ":path", value, value_len,
+                                   log_ctx);
     } else if (name_len == 9 && strncmp(name, ":protocol", 9) == 0) {
-        return update_pseudo_field(ctx, &request->protocol, &ctx->seen_protocol, ":protocol",
-                                   value, value_len, log_ctx);
+        return update_pseudo_field(ctx, &request->protocol, &ctx->seen_protocol, ":protocol", value,
+                                   value_len, log_ctx);
     }
 
     if (log_ctx) {
@@ -138,8 +136,8 @@ static bool validate_regular_header_name(const char* name, size_t name_len, wtf_
     for (size_t i = 0; i < name_len; i++) {
         if (name[i] == ':') {
             if (log_ctx) {
-                WTF_LOG_ERROR(log_ctx, "qpack", "Invalid regular header name: %.*s",
-                              (int)name_len, name);
+                WTF_LOG_ERROR(log_ctx, "qpack", "Invalid regular header name: %.*s", (int)name_len,
+                              name);
             }
             return false;
         }
@@ -198,13 +196,14 @@ static bool process_header_name(wtf_header_decode_context* ctx, const char* name
     return process_regular_header(ctx, name, name_len, value, value_len, log_ctx);
 }
 
-static bool validate_required_connect_headers(wtf_context* ctx, wtf_connect_request* request)
+static bool validate_required_request_headers(wtf_context* ctx, wtf_connect_request* request)
 {
-    if (!request->method || strcmp(request->method, WTF_CONNECT_METHOD) != 0) {
+    if (!request->method || request->method[0] == '\0') {
         WTF_LOG_ERROR(ctx, "qpack", "Invalid or missing :method header");
         return false;
     }
-    if (!request->protocol || request->protocol[0] == '\0') {
+    if (strcmp(request->method, WTF_CONNECT_METHOD) == 0
+        && (!request->protocol || request->protocol[0] == '\0')) {
         WTF_LOG_ERROR(ctx, "qpack", "Missing :protocol header");
         return false;
     }
@@ -263,7 +262,7 @@ static bool wtf_connect_request_add_header(wtf_connect_request* request, const c
         return false;
     }
 
-    request->headers[request->header_count++] = (wtf_http_header_t){
+    request->headers[request->header_count++] = (wtf_http_header_t) {
         .name = header_name,
         .value = header_value,
     };
@@ -310,7 +309,7 @@ static bool wtf_connect_response_add_header(wtf_connect_response* response, cons
         return false;
     }
 
-    response->headers[response->header_count++] = (wtf_http_header_t){
+    response->headers[response->header_count++] = (wtf_http_header_t) {
         .name = header_name,
         .value = header_value,
     };
@@ -370,8 +369,8 @@ static bool process_response_header(wtf_header_decode_context* ctx, const char* 
         }
 
         if (log_ctx) {
-            WTF_LOG_ERROR(log_ctx, "qpack", "Unknown response pseudo-header: %.*s",
-                          (int)name_len, name);
+            WTF_LOG_ERROR(log_ctx, "qpack", "Unknown response pseudo-header: %.*s", (int)name_len,
+                          name);
         }
         ctx->malformed_header_block = true;
         return false;
@@ -699,13 +698,13 @@ wtf_result_t wtf_qpack_parse_connect_headers(wtf_context* ctx, wtf_http3_stream*
             if (decode_ctx.malformed_header_block) {
                 WTF_LOG_ERROR(ctx, "qpack", "Malformed CONNECT header block");
                 result = WTF_ERROR_PROTOCOL_VIOLATION;
-            } else if (!validate_required_connect_headers(ctx, request)) {
+            } else if (!validate_required_request_headers(ctx, request)) {
                 result = WTF_ERROR_PROTOCOL_VIOLATION;
             } else {
                 request->valid = true;
-                WTF_LOG_DEBUG(ctx, "qpack", "CONNECT headers validated successfully");
+                WTF_LOG_DEBUG(ctx, "qpack", "Request headers validated successfully");
                 WTF_LOG_TRACE(ctx, "qpack",
-                              "CONNECT request - method:%s, protocol:%s, scheme:%s, authority:%s",
+                              "Request - method:%s, protocol:%s, scheme:%s, authority:%s",
                               request->method ? request->method : "NULL",
                               request->protocol ? request->protocol : "NULL",
                               request->scheme ? request->scheme : "NULL",
@@ -786,8 +785,7 @@ wtf_result_t wtf_qpack_parse_response_headers(wtf_context* ctx, wtf_http3_stream
                 result = WTF_ERROR_PROTOCOL_VIOLATION;
             } else {
                 response->valid = true;
-                WTF_LOG_DEBUG(ctx, "qpack", "CONNECT response status: %u",
-                              response->status_code);
+                WTF_LOG_DEBUG(ctx, "qpack", "CONNECT response status: %u", response->status_code);
             }
             break;
 

@@ -40,13 +40,16 @@ static bool wtf_http3_client_start_connect_stream(wtf_http3_stream* stream);
 static wtf_result_t wtf_http3_client_send_connect_request(wtf_http3_stream* stream);
 static wtf_result_t wtf_session_establish(wtf_http3_stream* stream,
                                           const wtf_connect_response* response);
-static wtf_result_t wtf_http3_finish_connect_request(
-    wtf_http3_stream* stream, wtf_connection_decision_t decision,
-    const wtf_connection_response_t* response);
+static wtf_result_t wtf_http3_finish_connect_request(wtf_http3_stream* stream,
+                                                     wtf_connection_decision_t decision,
+                                                     const wtf_connection_response_t* response);
 static bool wtf_http3_process_connect_response(wtf_http3_stream* stream,
                                                wtf_connect_response* response);
 static bool wtf_http3_process_complete_connect_request(wtf_http3_stream* stream,
                                                        wtf_connect_request* request);
+static bool wtf_http3_process_decoded_request_headers(wtf_http3_stream* stream,
+                                                      wtf_connect_request* request);
+static bool wtf_http3_dispatch_http_request(wtf_http3_stream* stream);
 
 static size_t wtf_http3_stream_buffer_limit(const wtf_http3_stream* stream)
 {
@@ -97,27 +100,24 @@ static bool wtf_http3_stream_buffer_reserve(wtf_http3_stream* stream, size_t len
 
 static void wtf_http3_shutdown_connection(wtf_connection* conn, uint64_t error_code)
 {
-    if (!conn || !conn->context || !conn->context->quic_api
-        || !conn->quic_connection) {
+    if (!conn || !conn->context || !conn->context->quic_api || !conn->quic_connection) {
         return;
     }
 
-    conn->context->quic_api->ConnectionShutdown(
-        conn->quic_connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, error_code);
+    conn->context->quic_api->ConnectionShutdown(conn->quic_connection,
+                                                QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, error_code);
 }
 
 static void wtf_http3_abort_stream(wtf_http3_stream* stream, uint64_t error_code)
 {
     if (!stream || !stream->connection || !stream->connection->context
-        || !stream->connection->context->quic_api
-        || !stream->quic_stream) {
+        || !stream->connection->context->quic_api || !stream->quic_stream) {
         return;
     }
 
     stream->connection->context->quic_api->StreamShutdown(
         stream->quic_stream,
-        QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND | QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE,
-        error_code);
+        QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND | QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, error_code);
     stream->state = WTF_INTERNAL_STREAM_STATE_RESET;
 }
 
@@ -183,8 +183,9 @@ static bool wtf_http3_stream_buffer_append(wtf_http3_stream* stream, const uint8
 
 static uint32_t wtf_http3_pending_connect_limit(const wtf_connection* conn)
 {
-    uint32_t session_limit = conn && conn->max_sessions ? conn->max_sessions
-                                                        : WTF_DEFAULT_MAX_SESSIONS;
+    uint32_t session_limit = conn && conn->max_sessions
+        ? conn->max_sessions
+        : WTF_DEFAULT_MAX_SESSIONS;
     return min(session_limit, WTF_MAX_PENDING_CONNECT_REQUESTS);
 }
 
@@ -238,13 +239,12 @@ static bool wtf_http3_queue_connect_headers(wtf_http3_stream* stream, const uint
     mtx_lock(&conn->streams_mutex);
     uint32_t pending_limit = wtf_http3_pending_connect_limit(conn);
     if (stream->has_pending_connect_header_block) {
-        WTF_LOG_ERROR(conn->context, "connect",
-                      "Duplicate pending CONNECT headers on stream %llu",
+        WTF_LOG_ERROR(conn->context, "connect", "Duplicate pending CONNECT headers on stream %llu",
                       (unsigned long long)stream->id);
     } else if (conn->pending_connect_count >= pending_limit) {
         WTF_LOG_WARN(conn->context, "connect",
-                     "Pending CONNECT limit reached (%u) - rejecting stream %llu",
-                     pending_limit, (unsigned long long)stream->id);
+                     "Pending CONNECT limit reached (%u) - rejecting stream %llu", pending_limit,
+                     (unsigned long long)stream->id);
     } else {
         stream->pending_connect_header_block = copy;
         stream->pending_connect_header_length = length;
@@ -328,6 +328,11 @@ static void wtf_http3_stream_dispose(wtf_http3_stream* stream)
         free(stream->buffered_data);
     }
     wtf_http3_clear_pending_connect_headers(stream);
+    wtf_connect_request_cleanup(&stream->http_request);
+    free(stream->http_request_body);
+    stream->http_request_body = NULL;
+    stream->http_request_body_length = 0;
+    stream->http_request_body_capacity = 0;
     if (stream->capsule_buffer && stream->capsule_buffer != stream->capsule_inline) {
         free(stream->capsule_buffer);
     }
@@ -434,15 +439,14 @@ wtf_result_t wtf_connection_response_add_header(wtf_connection_response_t* respo
         return WTF_ERROR_OUT_OF_MEMORY;
     }
 
-    response->headers[response->header_count++] = (wtf_http_header_t){
+    response->headers[response->header_count++] = (wtf_http_header_t) {
         .name = copied_name,
         .value = copied_value,
     };
     return WTF_SUCCESS;
 }
 
-static wtf_connection_request_handle* wtf_connection_request_handle_create(
-    wtf_http3_stream* stream)
+static wtf_connection_request_handle* wtf_connection_request_handle_create(wtf_http3_stream* stream)
 {
     if (!stream) {
         return NULL;
@@ -573,8 +577,7 @@ bool wtf_http3_create_control_stream(wtf_connection* conn)
         stream, &control_stream);
 
     if (QUIC_FAILED(status)) {
-        WTF_LOG_ERROR(conn->context, "conn", "Failed to create control stream: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "conn", "Failed to create control stream: 0x%x", status);
         conn->control_stream = NULL;
         wtf_http3_stream_destroy(stream);
         return false;
@@ -582,11 +585,9 @@ bool wtf_http3_create_control_stream(wtf_connection* conn)
 
     stream->quic_stream = control_stream;
 
-    status = conn->context->quic_api->StreamStart(
-        control_stream, QUIC_STREAM_START_FLAG_NONE);
+    status = conn->context->quic_api->StreamStart(control_stream, QUIC_STREAM_START_FLAG_NONE);
     if (QUIC_FAILED(status) && status != QUIC_STATUS_PENDING) {
-        WTF_LOG_ERROR(conn->context, "conn", "StreamStart failed for control stream: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "conn", "StreamStart failed for control stream: 0x%x", status);
         conn->control_stream = NULL;
         wtf_http3_stream_destroy(stream);
         return false;
@@ -616,8 +617,7 @@ bool wtf_http3_create_qpack_streams(wtf_connection* conn)
         enc_stream, &encoder_stream);
 
     if (QUIC_FAILED(status)) {
-        WTF_LOG_ERROR(conn->context, "conn", "StreamOpen failed for encoder stream: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "conn", "StreamOpen failed for encoder stream: 0x%x", status);
         conn->qpack_encoder_stream = NULL;
         wtf_http3_stream_destroy(enc_stream);
         return false;
@@ -625,11 +625,9 @@ bool wtf_http3_create_qpack_streams(wtf_connection* conn)
 
     enc_stream->quic_stream = encoder_stream;
 
-    status = conn->context->quic_api->StreamStart(
-        encoder_stream, QUIC_STREAM_START_FLAG_NONE);
+    status = conn->context->quic_api->StreamStart(encoder_stream, QUIC_STREAM_START_FLAG_NONE);
     if (QUIC_FAILED(status) && status != QUIC_STATUS_PENDING) {
-        WTF_LOG_ERROR(conn->context, "conn", "StreamStart failed for encoder stream: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "conn", "StreamStart failed for encoder stream: 0x%x", status);
         conn->qpack_encoder_stream = NULL;
         wtf_http3_stream_destroy(enc_stream);
         return false;
@@ -653,8 +651,7 @@ bool wtf_http3_create_qpack_streams(wtf_connection* conn)
         dec_stream, &decoder_stream);
 
     if (QUIC_FAILED(status)) {
-        WTF_LOG_ERROR(conn->context, "conn", "StreamOpen failed for decoder stream: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "conn", "StreamOpen failed for decoder stream: 0x%x", status);
         conn->qpack_decoder_stream = NULL;
         wtf_http3_stream_destroy(dec_stream);
         return false;
@@ -662,11 +659,9 @@ bool wtf_http3_create_qpack_streams(wtf_connection* conn)
 
     dec_stream->quic_stream = decoder_stream;
 
-    status = conn->context->quic_api->StreamStart(
-        decoder_stream, QUIC_STREAM_START_FLAG_NONE);
+    status = conn->context->quic_api->StreamStart(decoder_stream, QUIC_STREAM_START_FLAG_NONE);
     if (QUIC_FAILED(status) && status != QUIC_STATUS_PENDING) {
-        WTF_LOG_ERROR(conn->context, "conn", "StreamStart failed for decoder stream: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "conn", "StreamStart failed for decoder stream: 0x%x", status);
         conn->qpack_decoder_stream = NULL;
         wtf_http3_stream_destroy(dec_stream);
         return false;
@@ -704,8 +699,7 @@ static bool wtf_http3_validate_settings(wtf_connection* conn)
     }
 
     if (conn->selected_webtransport_draft == WTF_WEBTRANSPORT_DRAFT_NONE) {
-        WTF_LOG_TRACE(conn->context, "settings",
-                      "No supported WebTransport draft enabled by peer");
+        WTF_LOG_TRACE(conn->context, "settings", "No supported WebTransport draft enabled by peer");
         return false;
     }
 
@@ -752,13 +746,11 @@ static bool wtf_http3_validate_settings(wtf_connection* conn)
 
         case WTF_WEBTRANSPORT_DRAFT_07:
             if (conn->role == WTF_ENDPOINT_CLIENT && !conn->peer_settings.enable_connect_protocol) {
-                WTF_LOG_TRACE(conn->context, "settings",
-                              "CONNECT protocol not enabled by peer");
+                WTF_LOG_TRACE(conn->context, "settings", "CONNECT protocol not enabled by peer");
                 return false;
             }
             if (!conn->peer_settings.h3_datagram_rfc_enabled) {
-                WTF_LOG_TRACE(conn->context, "settings",
-                              "RFC H3 datagrams not enabled by peer");
+                WTF_LOG_TRACE(conn->context, "settings", "RFC H3 datagrams not enabled by peer");
                 return false;
             }
             return true;
@@ -807,7 +799,8 @@ static bool wtf_http3_protocol_matches_selected_draft(const wtf_connection* conn
 
 static bool wtf_http3_process_pending_connects(wtf_connection* conn)
 {
-    if (!conn || !wtf_http3_connect_processing_ready(conn) || conn->pending_connect_count == 0) {
+    if (!conn || !conn->qpack.initialized || !conn->local_settings.settings_sent
+        || !conn->peer_settings.settings_received || conn->pending_connect_count == 0) {
         return true;
     }
 
@@ -840,7 +833,7 @@ static bool wtf_http3_process_pending_connects(wtf_connection* conn)
         wtf_http3_clear_pending_connect_headers(stream);
 
         if (parse_result == WTF_SUCCESS) {
-            wtf_http3_process_complete_connect_request(stream, &request);
+            wtf_http3_process_decoded_request_headers(stream, &request);
         } else {
             WTF_LOG_ERROR(conn->context, "connect",
                           "Buffered CONNECT headers failed to decode on stream %llu",
@@ -897,10 +890,19 @@ static wtf_frame_result_t wtf_http3_process_settings_frame(wtf_http3_stream* str
         &stream->connection->peer_settings);
 
     if (!wtf_http3_validate_settings(stream->connection)) {
-        WTF_LOG_ERROR(stream->connection->context, "settings",
-                      "Peer SETTINGS do not meet WebTransport requirements");
-        wtf_http3_shutdown_connection(stream->connection, WTF_WEBTRANSPORT_REQUIREMENTS_NOT_MET);
-        return WTF_FRAME_RESULT_SUCCESS;
+        bool can_serve_http = stream->connection->role == WTF_ENDPOINT_SERVER
+            && stream->connection->server && stream->connection->server->http_route_count > 0;
+        if (!can_serve_http) {
+            WTF_LOG_ERROR(stream->connection->context, "settings",
+                          "Peer SETTINGS do not meet WebTransport requirements");
+            wtf_http3_shutdown_connection(stream->connection,
+                                          WTF_WEBTRANSPORT_REQUIREMENTS_NOT_MET);
+            return WTF_FRAME_RESULT_SUCCESS;
+        }
+
+        WTF_LOG_DEBUG(stream->connection->context, "settings",
+                      "Peer did not negotiate WebTransport; HTTP/3 routes remain available");
+        stream->connection->selected_webtransport_draft = WTF_WEBTRANSPORT_DRAFT_NONE;
     }
 
     stream->connection->peer_settings.settings_received = true;
@@ -1026,8 +1028,7 @@ static wtf_frame_result_t wtf_http3_process_goaway_frame(wtf_http3_stream* strea
     uint64_t stream_id;
 
     if (!wtf_varint_decode(data_len, data, &offset, &stream_id)) {
-        WTF_LOG_ERROR(stream->connection->context, "http3",
-                      "Failed to decode GOAWAY stream ID");
+        WTF_LOG_ERROR(stream->connection->context, "http3", "Failed to decode GOAWAY stream ID");
         return WTF_FRAME_RESULT_INVALID_FRAME;
     }
 
@@ -1200,10 +1201,9 @@ static bool wtf_http3_process_webtransport_capsules(wtf_http3_stream* stream, co
     return false;
 }
 
-static wtf_frame_result_t wtf_http3_process_headers_frame(wtf_http3_stream* stream,
-                                                          const uint8_t* data, uint32_t length,
-                                                          wtf_connect_request* pending_request,
-                                                          bool* has_connect_headers)
+static wtf_frame_result_t wtf_http3_process_headers_frame(
+    wtf_http3_stream* stream, const uint8_t* data, uint32_t length,
+    wtf_connect_request* pending_request, bool* has_request_headers)
 {
     // HEADERS frames should only be processed on bidirectional streams (CONNECT requests)
     if (!WTF_STREAM_IS_UNIDIRECTIONAL(stream->id)) {
@@ -1227,7 +1227,7 @@ static wtf_frame_result_t wtf_http3_process_headers_frame(wtf_http3_stream* stre
             return processed ? WTF_FRAME_RESULT_SUCCESS : WTF_FRAME_RESULT_PROTOCOL_ERROR;
         }
 
-        if (!wtf_http3_connect_processing_ready(stream->connection)) {
+        if (!stream->connection->qpack.initialized) {
             return wtf_http3_queue_connect_headers(stream, data, length)
                 ? WTF_FRAME_RESULT_SUCCESS
                 : WTF_FRAME_RESULT_PROTOCOL_ERROR;
@@ -1236,8 +1236,20 @@ static wtf_frame_result_t wtf_http3_process_headers_frame(wtf_http3_stream* stre
         wtf_context* ctx = stream->connection->context;
         if (wtf_qpack_parse_connect_headers(ctx, stream, data, length, pending_request)
             == WTF_SUCCESS) {
-            if (has_connect_headers) {
-                *has_connect_headers = true;
+            if (strcmp(pending_request->method, WTF_CONNECT_METHOD) == 0
+                && !wtf_http3_connect_processing_ready(stream->connection)) {
+                wtf_connect_request_cleanup(pending_request);
+                return wtf_http3_queue_connect_headers(stream, data, length)
+                    ? WTF_FRAME_RESULT_SUCCESS
+                    : WTF_FRAME_RESULT_PROTOCOL_ERROR;
+            }
+            if (strcmp(pending_request->method, WTF_CONNECT_METHOD) != 0) {
+                return wtf_http3_process_decoded_request_headers(stream, pending_request)
+                    ? WTF_FRAME_RESULT_SUCCESS
+                    : WTF_FRAME_RESULT_PROTOCOL_ERROR;
+            }
+            if (has_request_headers) {
+                *has_request_headers = true;
             }
             return WTF_FRAME_RESULT_SUCCESS;
         }
@@ -1250,9 +1262,49 @@ static wtf_frame_result_t wtf_http3_process_headers_frame(wtf_http3_stream* stre
     return WTF_FRAME_RESULT_PROTOCOL_ERROR;
 }
 
+static bool wtf_http3_append_http_request_body(wtf_http3_stream* stream, const uint8_t* data,
+                                               size_t length)
+{
+    bool can_buffer = stream
+        && (stream->http_request_headers_received || stream->has_pending_connect_header_block);
+    if (!can_buffer || (!data && length > 0) || stream->http_request_dispatched) {
+        return false;
+    }
+    if (length == 0) {
+        return true;
+    }
+    if (length > WTF_MAX_HTTP_REQUEST_BODY_SIZE
+        || stream->http_request_body_length > WTF_MAX_HTTP_REQUEST_BODY_SIZE - length) {
+        WTF_LOG_WARN(stream->connection->context, "http3",
+                     "HTTP request body exceeds %u bytes on stream %llu",
+                     (unsigned int)WTF_MAX_HTTP_REQUEST_BODY_SIZE, (unsigned long long)stream->id);
+        return false;
+    }
+
+    size_t required = stream->http_request_body_length + length;
+    if (required > stream->http_request_body_capacity) {
+        size_t capacity = stream->http_request_body_capacity
+            ? stream->http_request_body_capacity
+            : 4096;
+        while (capacity < required) {
+            capacity = min(capacity * 2, (size_t)WTF_MAX_HTTP_REQUEST_BODY_SIZE);
+        }
+        uint8_t* body = realloc(stream->http_request_body, capacity);
+        if (!body) {
+            return false;
+        }
+        stream->http_request_body = body;
+        stream->http_request_body_capacity = capacity;
+    }
+
+    memcpy(stream->http_request_body + stream->http_request_body_length, data, length);
+    stream->http_request_body_length = required;
+    return true;
+}
+
 static wtf_frame_result_t wtf_http3_process_single_frame(
     wtf_http3_stream* stream, const wtf_frame_info* frame, const uint8_t* frame_data,
-    wtf_connect_request* pending_request, bool* has_connect_headers)
+    wtf_connect_request* pending_request, bool* has_request_headers)
 {
     switch (frame->type) {
         case WTF_FRAME_SETTINGS:
@@ -1267,8 +1319,7 @@ static wtf_frame_result_t wtf_http3_process_single_frame(
 
         case WTF_FRAME_HEADERS: {
             wtf_frame_result_t result = wtf_http3_process_headers_frame(
-                stream, frame_data, (uint32_t)frame->length, pending_request,
-                has_connect_headers);
+                stream, frame_data, (uint32_t)frame->length, pending_request, has_request_headers);
             return result;
         }
 
@@ -1279,6 +1330,13 @@ static wtf_frame_result_t wtf_http3_process_single_frame(
                               "DATA frame received on unidirectional stream %llu",
                               (unsigned long long)stream->id);
                 return WTF_FRAME_RESULT_PROTOCOL_ERROR;
+            }
+            if (stream->connection->role == WTF_ENDPOINT_SERVER
+                && (stream->http_request_headers_received
+                    || stream->has_pending_connect_header_block)) {
+                return wtf_http3_append_http_request_body(stream, frame_data, (size_t)frame->length)
+                    ? WTF_FRAME_RESULT_SUCCESS
+                    : WTF_FRAME_RESULT_PROTOCOL_ERROR;
             }
             return WTF_FRAME_RESULT_SUCCESS;
 
@@ -1304,7 +1362,7 @@ static wtf_frame_result_t wtf_http3_process_single_frame(
 
 static wtf_frame_result_t wtf_http3_process_frames(
     wtf_http3_stream* stream, const uint8_t* data, uint32_t length, uint32_t offset,
-    wtf_connect_request* pending_request, bool* has_connect_headers)
+    wtf_connect_request* pending_request, bool* has_request_headers)
 {
     size_t processed_bytes = offset;
 
@@ -1349,19 +1407,20 @@ static wtf_frame_result_t wtf_http3_process_frames(
                         wtf_session* session = wtf_connection_find_session(stream->connection,
                                                                            session_id);
                         if (session) {
-                            if (wtf_connection_associate_stream_with_session(stream->connection, stream,
-                                                                             session)) {
+                            if (wtf_connection_associate_stream_with_session(stream->connection,
+                                                                             stream, session)) {
                                 stream->webtransport_session = session;
                             } else {
                                 wtf_session_release(session);
                                 return WTF_FRAME_RESULT_PROTOCOL_ERROR;
                             }
                         } else {
-                            WTF_LOG_WARN(stream->connection->context, "webtransport",
-                                         "Rejecting WebTransport stream %llu for unknown session %llu",
-                                         (unsigned long long)stream->id,
-                                         (unsigned long long)session_id);
-                            wtf_http3_abort_stream(stream, WTF_WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+                            WTF_LOG_WARN(
+                                stream->connection->context, "webtransport",
+                                "Rejecting WebTransport stream %llu for unknown session %llu",
+                                (unsigned long long)stream->id, (unsigned long long)session_id);
+                            wtf_http3_abort_stream(stream,
+                                                   WTF_WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
                             return WTF_FRAME_RESULT_SUCCESS;
                         }
 
@@ -1425,7 +1484,8 @@ static wtf_frame_result_t wtf_http3_process_frames(
 
         size_t frame_header_end = processed_bytes + frame.header_size;
 
-        if (frame.length > SIZE_MAX - frame_header_end || frame_header_end + frame.length > length) {
+        if (frame.length > SIZE_MAX - frame_header_end
+            || frame_header_end + frame.length > length) {
             size_t remaining = length - frame_start;
             if (remaining > 0
                 && !wtf_http3_stream_buffer_replace(stream, data + frame_start, remaining)) {
@@ -1435,7 +1495,7 @@ static wtf_frame_result_t wtf_http3_process_frames(
         }
 
         wtf_frame_result_t result = wtf_http3_process_single_frame(
-            stream, &frame, data + frame_header_end, pending_request, has_connect_headers);
+            stream, &frame, data + frame_header_end, pending_request, has_request_headers);
 
         if (result != WTF_FRAME_RESULT_SUCCESS) {
             return result;
@@ -1449,8 +1509,9 @@ static wtf_frame_result_t wtf_http3_process_frames(
 
 static const char* wtf_http3_protocol_for_draft(wtf_webtransport_draft_t draft)
 {
-    return draft == WTF_WEBTRANSPORT_DRAFT_15 ? WTF_WEBTRANSPORT_PROTOCOL_DRAFT15
-                                              : WTF_WEBTRANSPORT_PROTOCOL_DRAFT02;
+    return draft == WTF_WEBTRANSPORT_DRAFT_15
+        ? WTF_WEBTRANSPORT_PROTOCOL_DRAFT15
+        : WTF_WEBTRANSPORT_PROTOCOL_DRAFT02;
 }
 
 static const char* wtf_http3_connect_protocol_for_connection(const wtf_connection* conn)
@@ -1527,8 +1588,7 @@ static bool wtf_http3_qpack_encode_header_field(
     header.val_offset = (lsxpack_strlen_t)name_len;
     header.val_len = (lsxpack_strlen_t)value_len;
 
-    if (*enc_stream_total > enc_stream_capacity
-        || qpack_prefix_len > header_block_capacity
+    if (*enc_stream_total > enc_stream_capacity || qpack_prefix_len > header_block_capacity
         || *header_payload_len > header_block_capacity - qpack_prefix_len) {
         if (heap_storage) {
             free(header_storage);
@@ -1557,8 +1617,7 @@ static bool wtf_http3_qpack_encode_header_field(
 }
 
 static void wtf_http3_client_fail_session(wtf_http3_stream* stream, wtf_result_t result,
-                                          const char* reason,
-                                          const wtf_connect_response* response)
+                                          const char* reason, const wtf_connect_response* response)
 {
     if (!stream || !stream->webtransport_session) {
         return;
@@ -1596,9 +1655,8 @@ static void wtf_http3_client_fail_session(wtf_http3_stream* stream, wtf_result_t
     }
 }
 
-static wtf_result_t wtf_http3_encode_connect_request(wtf_http3_stream* stream,
-                                                     uint8_t** request_data,
-                                                     uint32_t* request_length)
+static wtf_result_t wtf_http3_encode_connect_request(
+    wtf_http3_stream* stream, uint8_t** request_data, uint32_t* request_length)
 {
     if (!stream || !stream->connection || !stream->connection->client || !request_data
         || !request_length) {
@@ -1620,8 +1678,8 @@ static wtf_result_t wtf_http3_encode_connect_request(wtf_http3_stream* stream,
     uint32_t header_block_len = 0;
 
     mtx_lock(&conn->qpack.mutex);
-    if (!conn->qpack.initialized || lsqpack_enc_start_header(&conn->qpack.encoder, 0, stream->id)
-                                      != 0) {
+    if (!conn->qpack.initialized
+        || lsqpack_enc_start_header(&conn->qpack.encoder, 0, stream->id) != 0) {
         mtx_unlock(&conn->qpack.mutex);
         return WTF_ERROR_INVALID_STATE;
     }
@@ -1636,22 +1694,26 @@ static wtf_result_t wtf_http3_encode_connect_request(wtf_http3_stream* stream,
         conn, ":method", WTF_CONNECT_METHOD, enc_stream_buf, sizeof(enc_stream_buf),
         &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
         &header_payload_len);
-    encode_ok = encode_ok && wtf_http3_qpack_encode_header_field(
-        conn, ":protocol", wtf_http3_connect_protocol_for_connection(conn), enc_stream_buf,
-        sizeof(enc_stream_buf), &enc_stream_total, header_block, sizeof(header_block),
-        qpack_prefix_len, &header_payload_len);
-    encode_ok = encode_ok && wtf_http3_qpack_encode_header_field(
-        conn, ":scheme", WTF_HTTPS_SCHEME, enc_stream_buf, sizeof(enc_stream_buf),
-        &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
-        &header_payload_len);
-    encode_ok = encode_ok && wtf_http3_qpack_encode_header_field(
-        conn, ":authority", client->authority, enc_stream_buf, sizeof(enc_stream_buf),
-        &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
-        &header_payload_len);
-    encode_ok = encode_ok && wtf_http3_qpack_encode_header_field(
-        conn, ":path", client->path, enc_stream_buf, sizeof(enc_stream_buf),
-        &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
-        &header_payload_len);
+    encode_ok = encode_ok
+        && wtf_http3_qpack_encode_header_field(
+                    conn, ":protocol", wtf_http3_connect_protocol_for_connection(conn),
+                    enc_stream_buf, sizeof(enc_stream_buf), &enc_stream_total, header_block,
+                    sizeof(header_block), qpack_prefix_len, &header_payload_len);
+    encode_ok = encode_ok
+        && wtf_http3_qpack_encode_header_field(
+                    conn, ":scheme", WTF_HTTPS_SCHEME, enc_stream_buf, sizeof(enc_stream_buf),
+                    &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
+                    &header_payload_len);
+    encode_ok = encode_ok
+        && wtf_http3_qpack_encode_header_field(
+                    conn, ":authority", client->authority, enc_stream_buf, sizeof(enc_stream_buf),
+                    &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
+                    &header_payload_len);
+    encode_ok = encode_ok
+        && wtf_http3_qpack_encode_header_field(
+                    conn, ":path", client->path, enc_stream_buf, sizeof(enc_stream_buf),
+                    &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
+                    &header_payload_len);
 
     if (encode_ok && config->origin) {
         encode_ok = wtf_http3_qpack_encode_header_field(
@@ -1662,10 +1724,9 @@ static wtf_result_t wtf_http3_encode_connect_request(wtf_http3_stream* stream,
 
     if (encode_ok && conn->selected_webtransport_draft == WTF_WEBTRANSPORT_DRAFT_02) {
         encode_ok = wtf_http3_qpack_encode_header_field(
-            conn, WTF_WEBTRANSPORT_DRAFT02_REQUEST_HEADER,
-            WTF_WEBTRANSPORT_DRAFT02_REQUEST_VALUE, enc_stream_buf, sizeof(enc_stream_buf),
-            &enc_stream_total, header_block, sizeof(header_block), qpack_prefix_len,
-            &header_payload_len);
+            conn, WTF_WEBTRANSPORT_DRAFT02_REQUEST_HEADER, WTF_WEBTRANSPORT_DRAFT02_REQUEST_VALUE,
+            enc_stream_buf, sizeof(enc_stream_buf), &enc_stream_total, header_block,
+            sizeof(header_block), qpack_prefix_len, &header_payload_len);
     }
 
     for (size_t i = 0; encode_ok && i < config->header_count; i++) {
@@ -1678,7 +1739,7 @@ static wtf_result_t wtf_http3_encode_connect_request(wtf_http3_stream* stream,
     if (encode_ok) {
         enum lsqpack_enc_header_flags hflags;
         ssize_t pref_sz = lsqpack_enc_end_header(&conn->qpack.encoder, header_block,
-                                                qpack_prefix_len, &hflags);
+                                                 qpack_prefix_len, &hflags);
         if (pref_sz >= 0) {
             header_block_len = (uint32_t)(pref_sz + header_payload_len);
             if (enc_stream_total > 0 && enc_stream_total <= sizeof(enc_stream_buf)
@@ -1908,8 +1969,7 @@ static bool wtf_http3_client_start_connect_stream(wtf_http3_stream* stream)
     status = conn->context->quic_api->StreamStart(quic_stream, QUIC_STREAM_START_FLAG_NONE);
     if (QUIC_FAILED(status) && status != QUIC_STATUS_PENDING) {
         wtf_result_t result = wtf_quic_status_to_result(status);
-        WTF_LOG_ERROR(conn->context, "connect", "Client CONNECT StreamStart failed: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "connect", "Client CONNECT StreamStart failed: 0x%x", status);
         wtf_http3_client_fail_session(stream, result, "CONNECT StreamStart failed", NULL);
         return false;
     }
@@ -1986,9 +2046,9 @@ static bool wtf_http3_process_connect_response(wtf_http3_stream* stream,
     return true;
 }
 
-static wtf_result_t wtf_http3_encode_response(wtf_http3_stream* stream, uint16_t status_code,
-                                              const wtf_connection_response_t* response,
-                                              uint8_t** response_data, uint32_t* response_length)
+static wtf_result_t wtf_http3_encode_response(
+    wtf_http3_stream* stream, uint16_t status_code, const wtf_connection_response_t* response,
+    bool include_webtransport_header, uint8_t** response_data, uint32_t* response_length)
 {
     if (!stream || !stream->connection || !response_data || !response_length || status_code < 100
         || status_code > 599) {
@@ -2018,13 +2078,15 @@ static wtf_result_t wtf_http3_encode_response(wtf_http3_stream* stream, uint16_t
             const char* name;
             const char* value;
         } wtf_response_header;
+
         wtf_response_header response_headers[2 + WTF_MAX_CONNECT_RESPONSE_HEADERS] = {
             {":status", status_value},
         };
         size_t response_header_count = 1;
 
-        if (conn->selected_webtransport_draft == WTF_WEBTRANSPORT_DRAFT_02) {
-            response_headers[response_header_count++] = (wtf_response_header){
+        if (include_webtransport_header
+            && conn->selected_webtransport_draft == WTF_WEBTRANSPORT_DRAFT_02) {
+            response_headers[response_header_count++] = (wtf_response_header) {
                 WTF_WEBTRANSPORT_DRAFT02_RESPONSE_HEADER,
                 WTF_WEBTRANSPORT_DRAFT02_RESPONSE_VALUE,
             };
@@ -2039,7 +2101,7 @@ static wtf_result_t wtf_http3_encode_response(wtf_http3_stream* stream, uint16_t
                     headers_valid = false;
                     break;
                 }
-                response_headers[response_header_count++] = (wtf_response_header){
+                response_headers[response_header_count++] = (wtf_response_header) {
                     response->headers[i].name,
                     response->headers[i].value,
                 };
@@ -2101,7 +2163,7 @@ static wtf_result_t wtf_http3_encode_response(wtf_http3_stream* stream, uint16_t
             if (encode_ok) {
                 enum lsqpack_enc_header_flags hflags;
                 ssize_t pref_sz = lsqpack_enc_end_header(&conn->qpack.encoder, header_data,
-                                                        qpack_prefix_len, &hflags);
+                                                         qpack_prefix_len, &hflags);
                 if (pref_sz >= 0) {
                     header_data_len = (uint32_t)(pref_sz + header_block_len);
                     if (enc_stream_total > 0 && enc_stream_total <= sizeof(enc_stream_buf)) {
@@ -2159,10 +2221,10 @@ static wtf_result_t wtf_http3_send_response(wtf_http3_stream* stream, uint16_t s
     uint32_t response_length = 0;
 
     wtf_result_t encode_result = wtf_http3_encode_response(
-        stream, status_code, response, &response_data, &response_length);
+        stream, status_code, response, true, &response_data, &response_length);
     if (encode_result != WTF_SUCCESS) {
-        WTF_LOG_ERROR(stream->connection->context, "connect",
-                      "Failed to encode status code %u", status_code);
+        WTF_LOG_ERROR(stream->connection->context, "connect", "Failed to encode status code %u",
+                      status_code);
         return encode_result;
     }
 
@@ -2183,6 +2245,104 @@ static wtf_result_t wtf_http3_send_response(wtf_http3_stream* stream, uint16_t s
         return wtf_quic_status_to_result(quic_status);
     }
 
+    return WTF_SUCCESS;
+}
+
+static wtf_result_t wtf_http3_send_http_response(
+    wtf_http3_stream* stream, const wtf_http_response_t* response, bool suppress_body)
+{
+    if (!stream || !stream->connection || !response) {
+        return WTF_ERROR_INVALID_PARAMETER;
+    }
+
+    uint16_t status_code = response->status_code ? response->status_code : 200;
+    if (status_code < 200 || status_code > 599
+        || response->header_count > WTF_MAX_CONNECT_RESPONSE_HEADERS
+        || response->body_buffer_count > WTF_MAX_SEND_BUFFERS
+        || (response->header_count > 0 && !response->headers)
+        || (response->body_buffer_count > 0 && !response->body_buffers)) {
+        return WTF_ERROR_INVALID_PARAMETER;
+    }
+
+    for (size_t i = 0; i < response->header_count; i++) {
+        if (!response->headers[i].name || !response->headers[i].value
+            || response->headers[i].name[0] == '\0' || response->headers[i].name[0] == ':') {
+            return WTF_ERROR_INVALID_PARAMETER;
+        }
+        for (const char* character = response->headers[i].name; *character; character++) {
+            if (*character >= 'A' && *character <= 'Z') {
+                return WTF_ERROR_INVALID_PARAMETER;
+            }
+        }
+    }
+
+    size_t body_length = 0;
+    if (!suppress_body) {
+        for (uint32_t i = 0; i < response->body_buffer_count; i++) {
+            const wtf_buffer_t* buffer = &response->body_buffers[i];
+            if ((!buffer->data && buffer->length > 0)
+                || body_length > UINT32_MAX - buffer->length) {
+                return WTF_ERROR_INVALID_PARAMETER;
+            }
+            body_length += buffer->length;
+        }
+    }
+
+    wtf_connection_response_t response_headers = {
+        .headers = (wtf_http_header_t*)response->headers,
+        .header_count = response->header_count,
+    };
+    uint8_t* header_data = NULL;
+    uint32_t header_length = 0;
+    wtf_result_t result = wtf_http3_encode_response(stream, status_code, &response_headers, false,
+                                                    &header_data, &header_length);
+    if (result != WTF_SUCCESS) {
+        return result;
+    }
+
+    size_t data_frame_header_length = body_length > 0
+        ? wtf_varint_size(WTF_FRAME_DATA) + wtf_varint_size(body_length)
+        : 0;
+    if (header_length > SIZE_MAX - data_frame_header_length
+        || header_length + data_frame_header_length > SIZE_MAX - body_length) {
+        free(header_data);
+        return WTF_ERROR_INVALID_PARAMETER;
+    }
+
+    size_t send_length = header_length + data_frame_header_length + body_length;
+    uint8_t* send_data = malloc(send_length);
+    if (!send_data) {
+        free(header_data);
+        return WTF_ERROR_OUT_OF_MEMORY;
+    }
+
+    memcpy(send_data, header_data, header_length);
+    free(header_data);
+    uint8_t* cursor = send_data + header_length;
+    if (body_length > 0) {
+        cursor = wtf_varint_encode(WTF_FRAME_DATA, cursor);
+        cursor = wtf_varint_encode(body_length, cursor);
+        for (uint32_t i = 0; i < response->body_buffer_count; i++) {
+            const wtf_buffer_t* buffer = &response->body_buffers[i];
+            if (buffer->length > 0) {
+                memcpy(cursor, buffer->data, buffer->length);
+                cursor += buffer->length;
+            }
+        }
+    }
+
+    wtf_internal_send_context* send_ctx = NULL;
+    result = wtf_internal_send_context_take_buffer(send_data, send_length, &send_ctx);
+    if (result != WTF_SUCCESS) {
+        return result;
+    }
+
+    QUIC_STATUS status = stream->connection->context->quic_api->StreamSend(
+        stream->quic_stream, (QUIC_BUFFER*)send_ctx->buffers, 1, QUIC_SEND_FLAG_FIN, send_ctx);
+    if (QUIC_FAILED(status)) {
+        wtf_internal_send_context_destroy(send_ctx);
+        return wtf_quic_status_to_result(status);
+    }
     return WTF_SUCCESS;
 }
 
@@ -2218,9 +2378,9 @@ static wtf_result_t wtf_session_establish(wtf_http3_stream* stream,
     return WTF_SUCCESS;
 }
 
-static wtf_result_t wtf_http3_finish_connect_request(
-    wtf_http3_stream* stream, wtf_connection_decision_t decision,
-    const wtf_connection_response_t* response)
+static wtf_result_t wtf_http3_finish_connect_request(wtf_http3_stream* stream,
+                                                     wtf_connection_decision_t decision,
+                                                     const wtf_connection_response_t* response)
 {
     if (!stream || !stream->connection || decision == WTF_CONNECTION_DEFER) {
         return WTF_ERROR_INVALID_PARAMETER;
@@ -2287,8 +2447,7 @@ static bool wtf_http3_process_complete_connect_request(wtf_http3_stream* stream,
     wtf_connection* conn = stream->connection;
     bool success = false;
 
-    WTF_LOG_INFO(conn->context, "connect",
-                 "Processing complete CONNECT request on stream %llu",
+    WTF_LOG_INFO(conn->context, "connect", "Processing complete CONNECT request on stream %llu",
                  (unsigned long long)stream->id);
 
     if (!wtf_http3_connect_processing_ready(conn)) {
@@ -2348,8 +2507,7 @@ static bool wtf_http3_process_complete_connect_request(wtf_http3_stream* stream,
             .address_length = sizeof(conn->peer_address),
             .handle = handle};
 
-        decision = conn->connection_validator(&conn_request, &handle->response,
-                                              conn->user_context);
+        decision = conn->connection_validator(&conn_request, &handle->response, conn->user_context);
     }
 
     if (decision == WTF_CONNECTION_DEFER) {
@@ -2368,6 +2526,120 @@ cleanup:
     wtf_connect_request_cleanup(request);
 
     return success;
+}
+
+static bool wtf_http3_process_decoded_request_headers(wtf_http3_stream* stream,
+                                                      wtf_connect_request* request)
+{
+    if (!stream || !stream->connection || !request) {
+        return false;
+    }
+
+    if (request->method && strcmp(request->method, WTF_CONNECT_METHOD) == 0) {
+        return wtf_http3_process_complete_connect_request(stream, request);
+    }
+
+    if (!request->valid || !request->method || !request->scheme
+        || strcmp(request->scheme, WTF_HTTPS_SCHEME) != 0 || !request->authority
+        || request->authority[0] == '\0' || !request->path || request->path[0] != '/'
+        || request->protocol || stream->http_request_headers_received
+        || stream->http_request_dispatched) {
+        WTF_LOG_ERROR(stream->connection->context, "http3",
+                      "Invalid HTTP/3 request headers on stream %llu",
+                      (unsigned long long)stream->id);
+        wtf_connect_request_cleanup(request);
+        return false;
+    }
+
+    stream->http_request = *request;
+    memset(request, 0, sizeof(*request));
+    stream->http_request_headers_received = true;
+
+    if (stream->http_request_peer_fin) {
+        return wtf_http3_dispatch_http_request(stream);
+    }
+    return true;
+}
+
+static bool wtf_http3_route_path_matches(const char* route_path, const char* request_path)
+{
+    if (!route_path || !request_path) {
+        return false;
+    }
+    size_t request_path_length = strcspn(request_path, "?");
+    return strlen(route_path) == request_path_length
+        && memcmp(route_path, request_path, request_path_length) == 0;
+}
+
+static bool wtf_http3_dispatch_http_request(wtf_http3_stream* stream)
+{
+    if (!stream || !stream->connection || !stream->connection->server
+        || !stream->http_request_headers_received) {
+        return false;
+    }
+    if (stream->http_request_dispatched) {
+        return true;
+    }
+    stream->http_request_dispatched = true;
+
+    wtf_server* server = stream->connection->server;
+    wtf_http_route_handler_t handler = NULL;
+    void* user_context = NULL;
+    bool path_exists = false;
+
+    mtx_lock(&server->mutex);
+    for (wtf_http_route* route = server->http_routes; route; route = route->next) {
+        if (!wtf_http3_route_path_matches(route->path, stream->http_request.path)) {
+            continue;
+        }
+        path_exists = true;
+        if (strcmp(route->method, stream->http_request.method) == 0) {
+            handler = route->handler;
+            user_context = route->user_context;
+            break;
+        }
+    }
+    mtx_unlock(&server->mutex);
+
+    wtf_http_response_t response = {
+        .status_code = handler ? 200 : (path_exists ? 405 : 404),
+    };
+    if (handler) {
+        const wtf_http_request_t request = {
+            .method = stream->http_request.method,
+            .path = stream->http_request.path,
+            .authority = stream->http_request.authority,
+            .headers = stream->http_request.headers,
+            .header_count = stream->http_request.header_count,
+            .body = stream->http_request_body,
+            .body_length = stream->http_request_body_length,
+            .peer_address = &stream->connection->peer_address,
+            .address_length = sizeof(stream->connection->peer_address),
+        };
+        handler(&request, &response, user_context);
+    }
+
+    bool suppress_body = strcmp(stream->http_request.method, "HEAD") == 0;
+    wtf_result_t result = wtf_http3_send_http_response(stream, &response, suppress_body);
+    if (result == WTF_ERROR_INVALID_PARAMETER && handler) {
+        WTF_LOG_ERROR(stream->connection->context, "http3",
+                      "HTTP route returned an invalid response on stream %llu",
+                      (unsigned long long)stream->id);
+        const wtf_http_response_t internal_error = {.status_code = 500};
+        result = wtf_http3_send_http_response(stream, &internal_error, false);
+    }
+    if (result != WTF_SUCCESS) {
+        WTF_LOG_ERROR(stream->connection->context, "http3",
+                      "Failed to send HTTP response on stream %llu: %s",
+                      (unsigned long long)stream->id, wtf_result_to_string(result));
+        return false;
+    }
+
+    WTF_LOG_DEBUG(stream->connection->context, "http3",
+                  "HTTP %s %s completed with status %u on stream %llu", stream->http_request.method,
+                  stream->http_request.path, response.status_code ? response.status_code : 200,
+                  (unsigned long long)stream->id);
+    return true;
 }
 
 static bool wtf_http3_parse_uni_stream_type(wtf_http3_stream* stream, const uint8_t* data,
@@ -2475,8 +2747,7 @@ static bool wtf_associate_webtransport_session(wtf_http3_stream* stream, const u
     if (!wtf_varint_decode(length, data, &session_offset, &session_id)) {
         // Buffer incomplete data
         size_t remaining = length - *offset;
-        if (remaining > 0
-            && !wtf_http3_stream_buffer_replace(stream, data + *offset, remaining)) {
+        if (remaining > 0 && !wtf_http3_stream_buffer_replace(stream, data + *offset, remaining)) {
             return false;
         }
         return true;
@@ -2594,6 +2865,13 @@ static bool wtf_http3_process_stream_receive(wtf_http3_stream* stream, const QUI
 
     if (!data || length == 0) {
         if (fin) {
+            if (stream->connection->role == WTF_ENDPOINT_SERVER
+                && !WTF_STREAM_IS_UNIDIRECTIONAL(stream->id) && !stream->is_webtransport) {
+                stream->http_request_peer_fin = true;
+                if (stream->http_request_headers_received) {
+                    return wtf_http3_dispatch_http_request(stream);
+                }
+            }
             static const uint8_t empty_data = 0;
             const uint8_t* fin_data = data ? data : &empty_data;
             return wtf_process_webtransport_stream_data(stream, fin_data, 0, &offset, true);
@@ -2635,10 +2913,10 @@ static bool wtf_http3_process_stream_receive(wtf_http3_stream* stream, const QUI
     }
 
     wtf_connect_request pending_connect_request = {0};
-    bool has_connect_headers = false;
+    bool has_request_headers = false;
 
     wtf_frame_result_t frame_result = wtf_http3_process_frames(
-        stream, data, length, offset, &pending_connect_request, &has_connect_headers);
+        stream, data, length, offset, &pending_connect_request, &has_request_headers);
 
     if (frame_result != WTF_FRAME_RESULT_SUCCESS) {
         // Clean up pending request on error
@@ -2646,12 +2924,19 @@ static bool wtf_http3_process_stream_receive(wtf_http3_stream* stream, const QUI
         return false;
     }
 
-    // Process complete CONNECT requests (creates user-visible sessions)
-    if (has_connect_headers) {
-        return wtf_http3_process_complete_connect_request(stream, &pending_connect_request);
+    // Process complete CONNECT requests (creates user-visible sessions).
+    if (has_request_headers) {
+        return wtf_http3_process_decoded_request_headers(stream, &pending_connect_request);
     }
 
     wtf_connect_request_cleanup(&pending_connect_request);
+    if (fin && stream->connection->role == WTF_ENDPOINT_SERVER
+        && !WTF_STREAM_IS_UNIDIRECTIONAL(stream->id) && !stream->is_webtransport) {
+        stream->http_request_peer_fin = true;
+        if (stream->http_request_headers_received) {
+            return wtf_http3_dispatch_http_request(stream);
+        }
+    }
     return true;
 }
 
@@ -2676,8 +2961,7 @@ static QUIC_STATUS wtf_handle_stream_start_complete(wtf_http3_stream* stream,
     mtx_lock(&conn->streams_mutex);
     http3_stream_map_itr itr = http3_stream_map_insert(&conn->streams, stream->id, stream);
     if (http3_stream_map_is_end(itr)) {
-        WTF_LOG_ERROR(conn->context, "stream",
-                      "Failed to add stream to map after START_COMPLETE");
+        WTF_LOG_ERROR(conn->context, "stream", "Failed to add stream to map after START_COMPLETE");
     } else {
         wtf_http3_stream_add_ref(stream);
     }
@@ -2722,8 +3006,7 @@ static QUIC_STATUS wtf_handle_stream_start_complete(wtf_http3_stream* stream,
         }
 
         if (stream->type == WTF_STREAM_TYPE_CONTROL) {
-            WTF_LOG_INFO(conn->context, "http3",
-                         "Control stream ready - sending server SETTINGS");
+            WTF_LOG_INFO(conn->context, "http3", "Control stream ready - sending server SETTINGS");
         }
 
         wtf_internal_send_context* send_ctx = NULL;
@@ -2739,8 +3022,7 @@ static QUIC_STATUS wtf_handle_stream_start_complete(wtf_http3_stream* stream,
         }
 
         QUIC_STATUS status = conn->context->quic_api->StreamSend(
-            stream->quic_stream, (QUIC_BUFFER*)send_ctx->buffers, 1, QUIC_SEND_FLAG_NONE,
-            send_ctx);
+            stream->quic_stream, (QUIC_BUFFER*)send_ctx->buffers, 1, QUIC_SEND_FLAG_NONE, send_ctx);
 
         if (QUIC_SUCCEEDED(status)) {
             WTF_LOG_INFO(conn->context, "http3", "Stream type %llu sent on stream %llu",
@@ -2771,8 +3053,8 @@ static QUIC_STATUS wtf_handle_stream_start_complete(wtf_http3_stream* stream,
                 }
             }
         } else {
-            WTF_LOG_ERROR(conn->context, "stream",
-                          "Failed to send stream type and data: 0x%x", status);
+            WTF_LOG_ERROR(conn->context, "stream", "Failed to send stream type and data: 0x%x",
+                          status);
             wtf_internal_send_context_destroy(send_ctx);
             conn->context->quic_api->StreamShutdown(
                 stream->quic_stream,
@@ -2795,8 +3077,7 @@ static QUIC_STATUS wtf_handle_stream_receive(wtf_http3_stream* stream, HQUIC Str
     QUIC_STATUS status = conn->context->quic_api->GetParam(
         Stream, QUIC_PARAM_STREAM_ID, &stream_id_size, &stream_id);
     if (QUIC_FAILED(status)) {
-        WTF_LOG_ERROR(conn->context, "stream", "Failed to get stream ID for receive: 0x%x",
-                      status);
+        WTF_LOG_ERROR(conn->context, "stream", "Failed to get stream ID for receive: 0x%x", status);
         conn->context->quic_api->StreamShutdown(
             Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND | QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE,
             WTF_H3_INTERNAL_ERROR);
@@ -2830,10 +3111,8 @@ static QUIC_STATUS wtf_handle_stream_receive(wtf_http3_stream* stream, HQUIC Str
 
     for (uint32_t i = 0; i < Event->RECEIVE.BufferCount; i++) {
         bool buffer_has_fin = is_fin && i + 1 == Event->RECEIVE.BufferCount;
-        if (!wtf_http3_process_stream_receive(stream, &Event->RECEIVE.Buffers[i],
-                                              buffer_has_fin)) {
-            WTF_LOG_ERROR(conn->context, "stream",
-                          "Failed to process stream data on stream %llu",
+        if (!wtf_http3_process_stream_receive(stream, &Event->RECEIVE.Buffers[i], buffer_has_fin)) {
+            WTF_LOG_ERROR(conn->context, "stream", "Failed to process stream data on stream %llu",
                           (unsigned long long)stream_id);
 
             uint64_t error_code = WTF_H3_GENERAL_PROTOCOL_ERROR;
@@ -2899,6 +3178,7 @@ static QUIC_STATUS wtf_handle_stream_shutdown_events(wtf_http3_stream* stream, H
         Stream, QUIC_PARAM_STREAM_ID, &stream_id_size, &stream_id);
 
     wtf_http3_stream* stream_to_destroy = NULL;
+    wtf_http3_stream* stream_to_dispatch = NULL;
     bool release_map_ref = false;
 
     if (QUIC_SUCCEEDED(status)) {
@@ -2914,15 +3194,23 @@ static QUIC_STATUS wtf_handle_stream_shutdown_events(wtf_http3_stream* stream, H
                     } else {
                         current->state = WTF_INTERNAL_STREAM_STATE_HALF_CLOSED_REMOTE;
                     }
-                    WTF_LOG_DEBUG(conn->context, "stream",
-                                  "Peer send shutdown on stream %llu",
+                    WTF_LOG_DEBUG(conn->context, "stream", "Peer send shutdown on stream %llu",
                                   (unsigned long long)stream_id);
+                    if (conn->role == WTF_ENDPOINT_SERVER
+                        && !WTF_STREAM_IS_UNIDIRECTIONAL(current->id)
+                        && !current->is_webtransport) {
+                        current->http_request_peer_fin = true;
+                        if (current->http_request_headers_received
+                            && !current->http_request_dispatched) {
+                            wtf_http3_stream_add_ref(current);
+                            stream_to_dispatch = current;
+                        }
+                    }
                     break;
 
                 case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
                     current->state = WTF_INTERNAL_STREAM_STATE_RESET;
-                    WTF_LOG_DEBUG(conn->context, "stream",
-                                  "Peer send aborted on stream %llu",
+                    WTF_LOG_DEBUG(conn->context, "stream", "Peer send aborted on stream %llu",
                                   (unsigned long long)stream_id);
                     break;
 
@@ -2961,6 +3249,13 @@ static QUIC_STATUS wtf_handle_stream_shutdown_events(wtf_http3_stream* stream, H
             }
         }
         mtx_unlock(&conn->streams_mutex);
+    }
+
+    if (stream_to_dispatch) {
+        if (!wtf_http3_dispatch_http_request(stream_to_dispatch)) {
+            wtf_http3_abort_stream(stream_to_dispatch, WTF_H3_INTERNAL_ERROR);
+        }
+        wtf_http3_stream_release(stream_to_dispatch);
     }
 
     if (stream_to_destroy) {

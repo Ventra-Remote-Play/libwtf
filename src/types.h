@@ -32,6 +32,7 @@ extern "C" {
 #define WTF_INLINE_CAPSULE_STORAGE 32
 #define WTF_MAX_DATAGRAM_SIZE 65536
 #define WTF_MAX_STREAM_BUFFER_SIZE (1024 * 1024)
+#define WTF_MAX_HTTP_REQUEST_BODY_SIZE (1024 * 1024)
 #define WTF_MAX_CONNECT_RESPONSE_HEADERS 32
 #define WTF_MAX_CONNECT_RESPONSE_HEADER_BYTES 8192
 #define WTF_CLOSE_ERROR_CODE_LENGTH 4
@@ -115,6 +116,7 @@ typedef struct wtf_settings wtf_settings;
 typedef struct wtf_connect_request wtf_connect_request;
 typedef struct wtf_connect_response wtf_connect_response;
 typedef struct wtf_connection_request_handle wtf_connection_request_handle;
+typedef struct wtf_http_route wtf_http_route;
 typedef struct wtf_header_decode_context wtf_header_decode_context;
 typedef struct wtf_send_context wtf_send_context;
 typedef struct wtf_capsule wtf_capsule;
@@ -278,6 +280,14 @@ typedef struct wtf_connect_response {
     bool valid;
 } wtf_connect_response;
 
+typedef struct wtf_http_route {
+    char* method;
+    char* path;
+    wtf_http_route_handler_t handler;
+    void* user_context;
+    struct wtf_http_route* next;
+} wtf_http_route;
+
 typedef struct wtf_connection_request_handle {
     atomic_uint ref_count;
     bool completed;
@@ -331,6 +341,14 @@ typedef struct wtf_http3_stream {
     size_t pending_connect_header_length;
     bool has_pending_connect_header_block;
     struct wtf_http3_stream* next_client_pending_connect;
+
+    wtf_connect_request http_request;
+    uint8_t* http_request_body;
+    size_t http_request_body_length;
+    size_t http_request_body_capacity;
+    bool http_request_headers_received;
+    bool http_request_dispatched;
+    bool http_request_peer_fin;
 
     uint64_t capsule_type;
     uint64_t capsule_length;
@@ -434,6 +452,10 @@ typedef struct wtf_server {
     mtx_t connections_mutex;
     cnd_t connections_drained;
     bool destroying;
+
+    wtf_http_route* http_routes;
+    wtf_http_route* http_routes_tail;
+    size_t http_route_count;
 
     mtx_t mutex;
 } wtf_server;
