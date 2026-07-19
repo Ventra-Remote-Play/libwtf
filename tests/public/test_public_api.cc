@@ -275,11 +275,14 @@ TEST(PublicApiSurface, SessionNullContracts)
     EXPECT_EQ(0u, wtf_session_get_max_datagram_size(nullptr));
     EXPECT_EQ(nullptr, wtf_session_find_stream_by_id(nullptr, 1));
     EXPECT_EQ(nullptr, wtf_session_get_context(nullptr));
+    EXPECT_EQ(nullptr, wtf_session_get_connection(nullptr));
+    EXPECT_EQ(nullptr, wtf_connection_get_context(nullptr));
 
     wtf_session_ref(nullptr);
     wtf_session_unref(nullptr);
     wtf_session_set_callback(nullptr, nullptr, nullptr);
     wtf_session_set_context(nullptr, nullptr);
+    wtf_connection_set_context(nullptr, nullptr);
 }
 
 TEST(PublicApiSurface, StreamNullContracts)

@@ -201,6 +201,7 @@ static wtf_connection* wtf_connection_create_common(wtf_context* context, HQUIC 
                                                           : WTF_DEFAULT_MAX_DATA_PER_SESSION;
     atomic_init(&conn->datagram_send_enabled, false);
     atomic_init(&conn->max_datagram_size, 0);
+    atomic_init(&conn->application_context, (uintptr_t)NULL);
 
     wtf_settings_init(&conn->local_settings);
     wtf_settings_init(&conn->peer_settings);
@@ -252,6 +253,25 @@ static wtf_connection* wtf_connection_create_common(wtf_context* context, HQUIC 
                                     &conn->peer_address);
     }
     return conn;
+}
+
+void wtf_connection_set_context(wtf_connection_t* connection, void* user_context)
+{
+    if (!connection) {
+        return;
+    }
+    wtf_connection* conn = (wtf_connection*)connection;
+    atomic_store_explicit(&conn->application_context, (uintptr_t)user_context,
+                          memory_order_release);
+}
+
+void* wtf_connection_get_context(wtf_connection_t* connection)
+{
+    if (!connection) {
+        return NULL;
+    }
+    wtf_connection* conn = (wtf_connection*)connection;
+    return (void*)atomic_load_explicit(&conn->application_context, memory_order_acquire);
 }
 
 wtf_connection* wtf_connection_create(wtf_server* server, HQUIC quic_connection)

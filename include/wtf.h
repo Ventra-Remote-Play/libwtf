@@ -35,6 +35,7 @@ typedef struct wtf_server wtf_server_t;
 typedef struct wtf_client wtf_client_t;
 typedef struct wtf_session wtf_session_t;
 typedef struct wtf_stream wtf_stream_t;
+typedef struct wtf_connection wtf_connection_t;
 typedef struct wtf_connection_request_handle wtf_connection_request_handle_t;
 
 // #endregion
@@ -276,6 +277,7 @@ typedef struct {
     size_t body_length;
     const void* peer_address;
     size_t address_length;
+    wtf_connection_t* connection;  //! Borrowed physical QUIC connection handle
 } wtf_http_request_t;
 
 //! HTTP/3 response filled by a route handler.
@@ -307,6 +309,7 @@ typedef struct {
     void* peer_address;                       //! Peer network address; valid only during callback
     size_t address_length;                    //! Size of address structure
     wtf_connection_request_handle_t* handle;  //! Complete this handle if returning DEFER
+    wtf_connection_t* connection;             //! Borrowed physical QUIC connection handle
 } wtf_connection_request_t;
 
 //! Session event data structure
@@ -625,6 +628,13 @@ WTF_API wtf_result_t wtf_server_add_http_route(wtf_server_t* server, const char*
                                                const char* path, wtf_http_route_handler_t handler,
                                                void* user_context);
 
+//! Set application context shared by HTTP/3 requests and all WebTransport sessions on this
+//! physical QUIC connection. The pointer is stored atomically and remains owned by the application.
+WTF_API void wtf_connection_set_context(wtf_connection_t* connection, void* user_context);
+
+//! Get application context for a physical QUIC connection.
+WTF_API void* wtf_connection_get_context(wtf_connection_t* connection);
+
 //! Add a non-pseudo HTTP response header while handling a connection validation callback.
 //! The name and value are copied. Header names beginning with ':' are rejected.
 //! @param response response object passed to wtf_connection_validator_t
@@ -804,6 +814,10 @@ WTF_API void wtf_session_set_context(wtf_session_t* session, void* user_context)
 //! @param session target session
 //! @return user-provided context data
 WTF_API void* wtf_session_get_context(wtf_session_t* session);
+
+//! Get the borrowed physical QUIC connection shared by this WebTransport session and HTTP/3.
+//! The returned handle is valid while the session is valid and must not be freed by the application.
+WTF_API wtf_connection_t* wtf_session_get_connection(wtf_session_t* session);
 
 // #endregion
 

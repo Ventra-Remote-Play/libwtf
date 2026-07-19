@@ -2505,7 +2505,8 @@ static bool wtf_http3_process_complete_connect_request(wtf_http3_stream* stream,
             .header_count = request->header_count,
             .peer_address = &conn->peer_address,
             .address_length = sizeof(conn->peer_address),
-            .handle = handle};
+            .handle = handle,
+            .connection = (wtf_connection_t*)conn};
 
         decision = conn->connection_validator(&conn_request, &handle->response, conn->user_context);
     }
@@ -2615,6 +2616,7 @@ static bool wtf_http3_dispatch_http_request(wtf_http3_stream* stream)
             .body_length = stream->http_request_body_length,
             .peer_address = &stream->connection->peer_address,
             .address_length = sizeof(stream->connection->peer_address),
+            .connection = (wtf_connection_t*)stream->connection,
         };
         handler(&request, &response, user_context);
     }

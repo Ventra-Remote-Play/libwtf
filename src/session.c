@@ -1204,6 +1204,18 @@ void* wtf_session_get_context(wtf_session_t* session)
     return sess->user_context;
 }
 
+wtf_connection_t* wtf_session_get_connection(wtf_session_t* session)
+{
+    if (!session) {
+        return NULL;
+    }
+    wtf_session* sess = (wtf_session*)session;
+    if (sess->destroyed) {
+        return NULL;
+    }
+    return (wtf_connection_t*)sess->connection;
+}
+
 wtf_session_state_t wtf_session_get_state(wtf_session_t* session)
 {
     if (!session)

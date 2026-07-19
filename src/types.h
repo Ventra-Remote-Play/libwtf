@@ -404,6 +404,7 @@ typedef struct wtf_connection {
     wtf_connection_state_t state;
     atomic_bool datagram_send_enabled;
     atomic_uint max_datagram_size;
+    atomic_uintptr_t application_context;
 
     wtf_settings local_settings;
     wtf_settings peer_settings;

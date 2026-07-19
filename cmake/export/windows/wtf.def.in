@@ -11,6 +11,8 @@ EXPORTS
     wtf_server_stop
     wtf_server_get_state
     wtf_server_add_http_route
+    wtf_connection_set_context
+    wtf_connection_get_context
     wtf_connection_response_add_header
     wtf_connection_request_ref
     wtf_connection_request_unref
@@ -36,6 +38,7 @@ EXPORTS
     wtf_session_get_peer_address
     wtf_session_set_context
     wtf_session_get_context
+    wtf_session_get_connection
     wtf_stream_send
     wtf_stream_send_copy
     wtf_stream_close

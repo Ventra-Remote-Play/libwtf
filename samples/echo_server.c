@@ -39,14 +39,15 @@
 static volatile bool g_running = true;
 static wtf_server_t* g_server = NULL;
 static wtf_context_t* g_context = NULL;
+static int g_health_passed_marker = 0;
 void stream_callback(const wtf_stream_event_t* event);
 void session_callback(const wtf_session_event_t* event);
 
 static void health_route(const wtf_http_request_t* request, wtf_http_response_t* response,
                          void* user_context)
 {
-    (void)request;
     (void)user_context;
+    wtf_connection_set_context(request->connection, &g_health_passed_marker);
     static const wtf_http_header_t headers[] = {{"content-type", "text/plain"}};
     static const uint8_t body_part_1[] = "libwtf ";
     static const uint8_t body_part_2[] = "ok\n";
@@ -54,7 +55,8 @@ static void health_route(const wtf_http_request_t* request, wtf_http_response_t*
         {sizeof(body_part_1) - 1, body_part_1},
         {sizeof(body_part_2) - 1, body_part_2},
     };
-    response->status_code = 200;
+    response->status_code
+        = wtf_connection_get_context(request->connection) == &g_health_passed_marker ? 200 : 500;
     response->headers = headers;
     response->header_count = sizeof(headers) / sizeof(headers[0]);
     response->body_buffers = body;
@@ -512,6 +514,12 @@ void session_callback(const wtf_session_event_t* event)
     switch (event->type) {
         case WTF_SESSION_EVENT_CONNECTED: {
             printf("[SESSION] New session connected\n");
+
+            wtf_connection_t* connection = wtf_session_get_connection(event->session);
+            bool health_passed
+                = wtf_connection_get_context(connection) == &g_health_passed_marker;
+            printf("[SESSION] Connection health check: %s\n",
+                   health_passed ? "passed" : "not observed");
 
             session_ctx = malloc(sizeof(session_context_t));
             if (session_ctx) {
